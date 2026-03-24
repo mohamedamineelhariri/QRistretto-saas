@@ -2,41 +2,37 @@ import express from 'express';
 import { body, param, query } from 'express-validator';
 import { validate } from '../middleware/validation.js';
 import { verifyToken } from '../middleware/auth.js';
+import { tenantScope } from '../middleware/tenantScope.js';
+import { checkPermission } from '../middleware/rbac.js';
 import * as menuService from '../services/menu.service.js';
 
 const router = express.Router();
 
 /**
- * GET /api/menu/:restaurantId
- * Get menu for customers (public, but requires valid QR token)
+ * GET /api/menu/:locationId
+ * Get menu for customers (public, requires valid locationId)
  */
 router.get(
-    '/:restaurantId',
+    '/:locationId',
     [
-        param('restaurantId').isUUID().withMessage('Invalid restaurant ID'),
-        query('locale').optional().isIn(['en', 'fr', 'ar']).withMessage('Locale must be en, fr, or ar'),
+        param('locationId').isUUID().withMessage('Invalid location ID'),
+        query('locale').optional().isIn(['en', 'fr', 'ar']),
         validate,
     ],
     async (req, res) => {
         try {
-            const { restaurantId } = req.params;
+            const { locationId } = req.params;
             const locale = req.query.locale || 'en';
 
-            const menu = await menuService.getMenuByRestaurant(restaurantId, locale);
+            const menu = await menuService.getMenuByLocation(locationId, locale);
 
             res.json({
                 success: true,
-                data: {
-                    categories: menu,
-                    locale,
-                },
+                data: { categories: menu, locale },
             });
         } catch (error) {
             console.error('Get menu error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Failed to fetch menu',
-            });
+            res.status(500).json({ success: false, message: 'Failed to fetch menu' });
         }
     }
 );
@@ -48,20 +44,20 @@ router.get(
 router.get(
     '/admin/all',
     verifyToken,
+    tenantScope,
+    checkPermission('menu:read'),
     async (req, res) => {
         try {
-            const items = await menuService.getAllMenuItems(req.restaurantId);
+            const locationId = req.locationId;
+            if (!locationId) {
+                return res.status(400).json({ success: false, message: 'Location ID required' });
+            }
 
-            res.json({
-                success: true,
-                data: { items },
-            });
+            const items = await menuService.getAllMenuItems(locationId);
+            res.json({ success: true, data: { items } });
         } catch (error) {
             console.error('Get all menu items error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Failed to fetch menu items',
-            });
+            res.status(500).json({ success: false, message: 'Failed to fetch menu items' });
         }
     }
 );
@@ -73,10 +69,12 @@ router.get(
 router.post(
     '/',
     verifyToken,
+    tenantScope,
+    checkPermission('menu:write'),
     [
-        body('name').trim().isLength({ min: 1, max: 100 }).withMessage('Name required (max 100 chars)'),
-        body('category').trim().isLength({ min: 1, max: 50 }).withMessage('Category required'),
-        body('price').isFloat({ min: 0 }).withMessage('Valid price required'),
+        body('name').trim().isLength({ min: 1, max: 100 }),
+        body('category').trim().isLength({ min: 1, max: 50 }),
+        body('price').isFloat({ min: 0 }),
         body('nameFr').optional().trim().isLength({ max: 100 }),
         body('nameAr').optional().trim().isLength({ max: 100 }),
         body('description').optional().trim().isLength({ max: 500 }),
@@ -84,26 +82,23 @@ router.post(
         body('descriptionAr').optional().trim().isLength({ max: 500 }),
         body('categoryFr').optional().trim().isLength({ max: 50 }),
         body('categoryAr').optional().trim().isLength({ max: 50 }),
-        body('imageUrl').optional().isURL().withMessage('Invalid image URL'),
+        body('imageUrl').optional().isURL(),
         body('available').optional().isBoolean(),
         body('sortOrder').optional().isInt({ min: 0 }),
         validate,
     ],
     async (req, res) => {
         try {
-            const item = await menuService.createMenuItem(req.restaurantId, req.body);
+            const locationId = req.locationId;
+            if (!locationId) {
+                return res.status(400).json({ success: false, message: 'Location ID required' });
+            }
 
-            res.status(201).json({
-                success: true,
-                message: 'Menu item created',
-                data: { item },
-            });
+            const item = await menuService.createMenuItem(locationId, req.body);
+            res.status(201).json({ success: true, message: 'Menu item created', data: { item } });
         } catch (error) {
             console.error('Create menu item error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Failed to create menu item',
-            });
+            res.status(500).json({ success: false, message: 'Failed to create menu item' });
         }
     }
 );
@@ -115,8 +110,10 @@ router.post(
 router.put(
     '/:itemId',
     verifyToken,
+    tenantScope,
+    checkPermission('menu:write'),
     [
-        param('itemId').isUUID().withMessage('Invalid item ID'),
+        param('itemId').isUUID(),
         body('name').optional().trim().isLength({ min: 1, max: 100 }),
         body('category').optional().trim().isLength({ min: 1, max: 50 }),
         body('price').optional().isFloat({ min: 0 }),
@@ -127,27 +124,17 @@ router.put(
         try {
             const item = await menuService.updateMenuItem(
                 req.params.itemId,
-                req.restaurantId,
+                req.locationId,
                 req.body
             );
 
-            res.json({
-                success: true,
-                message: 'Menu item updated',
-                data: { item },
-            });
+            res.json({ success: true, message: 'Menu item updated', data: { item } });
         } catch (error) {
             console.error('Update menu item error:', error);
             if (error.message === 'Menu item not found') {
-                return res.status(404).json({
-                    success: false,
-                    message: 'Menu item not found',
-                });
+                return res.status(404).json({ success: false, message: 'Menu item not found' });
             }
-            res.status(500).json({
-                success: false,
-                message: 'Failed to update menu item',
-            });
+            res.status(500).json({ success: false, message: 'Failed to update menu item' });
         }
     }
 );
@@ -159,20 +146,19 @@ router.put(
 router.patch(
     '/:itemId/toggle',
     verifyToken,
-    [
-        param('itemId').isUUID().withMessage('Invalid item ID'),
-        validate,
-    ],
+    tenantScope,
+    checkPermission('menu:write'),
+    [param('itemId').isUUID(), validate],
     async (req, res) => {
         try {
             const item = await menuService.toggleItemAvailability(
                 req.params.itemId,
-                req.restaurantId
+                req.locationId
             );
 
             // Emit socket event for real-time update
             const io = req.app.get('io');
-            io.to(`restaurant:${req.restaurantId}`).emit('menu:updated', {
+            io.to(`restaurant:${req.locationId}`).emit('menu:updated', {
                 itemId: item.id,
                 available: item.available,
             });
@@ -184,73 +170,48 @@ router.patch(
             });
         } catch (error) {
             console.error('Toggle availability error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Failed to toggle availability',
-            });
+            res.status(500).json({ success: false, message: 'Failed to toggle availability' });
         }
     }
 );
 
 /**
  * DELETE /api/menu/:itemId
- * Delete menu item (admin only)
  */
 router.delete(
     '/:itemId',
     verifyToken,
-    [
-        param('itemId').isUUID().withMessage('Invalid item ID'),
-        validate,
-    ],
+    tenantScope,
+    checkPermission('menu:write'),
+    [param('itemId').isUUID(), validate],
     async (req, res) => {
         try {
-            await menuService.deleteMenuItem(req.params.itemId, req.restaurantId);
-
-            res.json({
-                success: true,
-                message: 'Menu item deleted',
-            });
+            await menuService.deleteMenuItem(req.params.itemId, req.locationId);
+            res.json({ success: true, message: 'Menu item deleted' });
         } catch (error) {
             console.error('Delete menu item error:', error);
             if (error.message === 'Menu item not found') {
-                return res.status(404).json({
-                    success: false,
-                    message: 'Menu item not found',
-                });
+                return res.status(404).json({ success: false, message: 'Menu item not found' });
             }
-            res.status(500).json({
-                success: false,
-                message: 'Failed to delete menu item',
-            });
+            res.status(500).json({ success: false, message: 'Failed to delete menu item' });
         }
     }
 );
 
 /**
- * GET /api/menu/categories/:restaurantId
- * Get unique categories
+ * GET /api/menu/categories/:locationId
+ * Get unique categories (public)
  */
 router.get(
-    '/categories/:restaurantId',
-    [
-        param('restaurantId').isUUID().withMessage('Invalid restaurant ID'),
-        validate,
-    ],
+    '/categories/:locationId',
+    [param('locationId').isUUID(), validate],
     async (req, res) => {
         try {
-            const categories = await menuService.getCategories(req.params.restaurantId);
-
-            res.json({
-                success: true,
-                data: { categories },
-            });
+            const categories = await menuService.getCategories(req.params.locationId);
+            res.json({ success: true, data: { categories } });
         } catch (error) {
             console.error('Get categories error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Failed to fetch categories',
-            });
+            res.status(500).json({ success: false, message: 'Failed to fetch categories' });
         }
     }
 );

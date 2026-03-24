@@ -1,41 +1,44 @@
 import prisma from '../config/database.js';
 
 /**
- * Generate next order number for the day
+ * Generate next order number for the day (atomic, race-safe)
+ * Now scoped per location instead of restaurant
  */
-async function getNextOrderNumber(restaurantId) {
-    // Get today's date range
+async function getNextOrderNumber(locationId) {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
 
-    // Count today's orders
-    const count = await prisma.order.count({
-        where: {
-            restaurantId,
-            createdAt: {
-                gte: today,
-                lt: tomorrow,
+    const result = await prisma.$transaction(async (tx) => {
+        const count = await tx.order.count({
+            where: {
+                locationId,
+                createdAt: {
+                    gte: today,
+                    lt: tomorrow,
+                },
             },
-        },
+        });
+        return count + 1;
+    }, {
+        isolationLevel: 'Serializable',
     });
 
-    return count + 1;
+    return result;
 }
 
 /**
  * Create a new order
- * Security: Validates all items belong to the restaurant
+ * Security: Validates all items belong to the location
  */
-export async function createOrder(restaurantId, tableId, items, notes = null) {
-    // Validate items exist and belong to restaurant
+export async function createOrder(locationId, tableId, items, notes = null, source = 'QR') {
     const menuItemIds = items.map(item => item.menuItemId);
 
     const menuItems = await prisma.menuItem.findMany({
         where: {
             id: { in: menuItemIds },
-            restaurantId,
+            locationId,
             available: true,
         },
     });
@@ -44,7 +47,6 @@ export async function createOrder(restaurantId, tableId, items, notes = null) {
         throw new Error('Some items are not available');
     }
 
-    // Calculate total and prepare order items
     let totalAmount = 0;
     const orderItems = items.map(item => {
         const menuItem = menuItems.find(m => m.id === item.menuItemId);
@@ -60,18 +62,17 @@ export async function createOrder(restaurantId, tableId, items, notes = null) {
         };
     });
 
-    // Get next order number
-    const orderNumber = await getNextOrderNumber(restaurantId);
+    const orderNumber = await getNextOrderNumber(locationId);
 
-    // Create order with items in transaction
     const order = await prisma.order.create({
         data: {
-            restaurantId,
+            locationId,
             tableId,
             orderNumber,
             totalAmount,
             notes,
             status: 'PENDING',
+            source,
             items: {
                 create: orderItems,
             },
@@ -80,19 +81,12 @@ export async function createOrder(restaurantId, tableId, items, notes = null) {
             items: {
                 include: {
                     menuItem: {
-                        select: {
-                            name: true,
-                            nameFr: true,
-                            nameAr: true,
-                        },
+                        select: { name: true, nameFr: true, nameAr: true },
                     },
                 },
             },
             table: {
-                select: {
-                    tableNumber: true,
-                    tableName: true,
-                },
+                select: { tableNumber: true, tableName: true },
             },
         },
     });
@@ -103,29 +97,22 @@ export async function createOrder(restaurantId, tableId, items, notes = null) {
 /**
  * Get orders by status for kitchen/waiter view
  */
-export async function getOrdersByStatus(restaurantId, statuses = ['PENDING', 'ACCEPTED', 'PREPARING', 'READY']) {
+export async function getOrdersByStatus(locationId, statuses = ['PENDING', 'ACCEPTED', 'PREPARING', 'READY']) {
     return prisma.order.findMany({
         where: {
-            restaurantId,
+            locationId,
             status: { in: statuses },
         },
         include: {
             items: {
                 include: {
                     menuItem: {
-                        select: {
-                            name: true,
-                            nameFr: true,
-                            nameAr: true,
-                        },
+                        select: { name: true, nameFr: true, nameAr: true },
                     },
                 },
             },
             table: {
-                select: {
-                    tableNumber: true,
-                    tableName: true,
-                },
+                select: { tableNumber: true, tableName: true },
             },
         },
         orderBy: { createdAt: 'asc' },
@@ -142,19 +129,12 @@ export async function getOrderById(orderId) {
             items: {
                 include: {
                     menuItem: {
-                        select: {
-                            name: true,
-                            nameFr: true,
-                            nameAr: true,
-                        },
+                        select: { name: true, nameFr: true, nameAr: true },
                     },
                 },
             },
             table: {
-                select: {
-                    tableNumber: true,
-                    tableName: true,
-                },
+                select: { tableNumber: true, tableName: true },
             },
         },
     });
@@ -164,19 +144,18 @@ export async function getOrderById(orderId) {
  * Update order status
  * Security: Only allows valid status transitions
  */
-export async function updateOrderStatus(orderId, restaurantId, newStatus) {
-    // Define valid transitions
+export async function updateOrderStatus(orderId, locationId, newStatus, userId = null, role = null) {
     const validTransitions = {
         PENDING: ['ACCEPTED', 'CANCELLED'],
-        ACCEPTED: ['PREPARING', 'CANCELLED'],
-        PREPARING: ['READY', 'CANCELLED'],
-        READY: ['DELIVERED'],
-        DELIVERED: [], // Final state
-        CANCELLED: [], // Final state
+        ACCEPTED: ['PREPARING', 'CANCELLED', 'PENDING'],
+        PREPARING: ['READY', 'CANCELLED', 'ACCEPTED'],
+        READY: ['DELIVERED', 'PREPARING'],
+        DELIVERED: [],
+        CANCELLED: [],
     };
 
     const order = await prisma.order.findFirst({
-        where: { id: orderId, restaurantId },
+        where: { id: orderId, locationId },
     });
 
     if (!order) {
@@ -187,57 +166,79 @@ export async function updateOrderStatus(orderId, restaurantId, newStatus) {
         throw new Error(`Cannot transition from ${order.status} to ${newStatus}`);
     }
 
+    const updateData = { status: newStatus };
+
+    // If accepting order, assign to waiter
+    if (newStatus === 'ACCEPTED' && userId && role === 'WAITER') {
+        if (order.waiterId && order.waiterId !== userId) {
+            throw new Error('Order is already being handled by another waiter');
+        }
+        updateData.waiterId = userId;
+    }
+
+    // Reverting to PENDING should unassign the waiter
+    if (newStatus === 'PENDING') {
+        updateData.waiterId = null;
+    }
+
+    // Validate ownership for delivery
+    if (newStatus === 'DELIVERED') {
+        if (order.waiterId && userId && order.waiterId !== userId) {
+            throw new Error('Only the assigned waiter can deliver this order');
+        }
+
+        // Deduct stock
+        try {
+            const { deductStockForOrder } = await import('./inventory.service.js');
+            await deductStockForOrder(orderId);
+        } catch (error) {
+            console.error('Stock deduction error:', error.message);
+        }
+    }
+
     return prisma.order.update({
         where: { id: orderId },
-        data: { status: newStatus },
+        data: updateData,
         include: {
             items: {
                 include: {
                     menuItem: {
-                        select: {
-                            name: true,
-                            nameFr: true,
-                            nameAr: true,
-                        },
+                        select: { name: true, nameFr: true, nameAr: true },
                     },
                 },
             },
             table: {
-                select: {
-                    tableNumber: true,
-                    tableName: true,
-                },
+                select: { tableNumber: true, tableName: true },
             },
         },
     });
 }
 
 /**
- * Get order history (completed orders)
+ * Get order history
  */
-export async function getOrderHistory(restaurantId, limit = 50, offset = 0) {
+export async function getOrderHistory(locationId, limit = 50, offset = 0, userId = null) {
+    const where = {
+        locationId,
+        status: { in: ['DELIVERED', 'CANCELLED'] },
+    };
+
+    if (userId) {
+        where.waiterId = userId;
+    }
+
     return prisma.order.findMany({
-        where: {
-            restaurantId,
-            status: { in: ['DELIVERED', 'CANCELLED'] },
-        },
+        where,
         include: {
             items: {
                 include: {
                     menuItem: {
-                        select: {
-                            name: true,
-                            nameFr: true,
-                            nameAr: true,
-                        },
+                        select: { name: true, nameFr: true, nameAr: true },
                     },
                 },
             },
             table: {
-                select: {
-                    tableNumber: true,
-                    tableName: true,
-                },
+                select: { tableNumber: true, tableName: true },
             },
         },
         orderBy: { createdAt: 'desc' },
@@ -250,7 +251,6 @@ export async function getOrderHistory(restaurantId, limit = 50, offset = 0) {
  * Get orders for a specific table (customer view)
  */
 export async function getOrdersByTable(tableId) {
-    // Get today's orders only
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
@@ -263,11 +263,7 @@ export async function getOrdersByTable(tableId) {
             items: {
                 include: {
                     menuItem: {
-                        select: {
-                            name: true,
-                            nameFr: true,
-                            nameAr: true,
-                        },
+                        select: { name: true, nameFr: true, nameAr: true },
                     },
                 },
             },

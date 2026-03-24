@@ -9,7 +9,7 @@ const router = express.Router();
 
 /**
  * POST /api/auth/login
- * Admin login - returns JWT token
+ * Unified login for all users (Owner, Manager, Waiter, Kitchen, Staff)
  */
 router.post(
     '/login',
@@ -22,29 +22,36 @@ router.post(
         try {
             const { email, password } = req.body;
 
-            // Find restaurant by admin email
-            const restaurant = await prisma.restaurant.findUnique({
-                where: { adminEmail: email },
-                select: {
-                    id: true,
-                    name: true,
-                    adminEmail: true,
-                    adminPassword: true,
-                    isActive: true,
+            const user = await prisma.user.findUnique({
+                where: { email },
+                include: {
+                    tenant: {
+                        select: {
+                            id: true,
+                            businessName: true,
+                            status: true,
+                            slug: true,
+                        },
+                    },
+                    permissions: { select: { permission: true } },
                 },
             });
 
-            // Generic error message (don't reveal if email exists)
-            if (!restaurant || !restaurant.isActive) {
+            if (!user || !user.isActive) {
                 return res.status(401).json({
                     success: false,
                     message: 'Invalid credentials',
                 });
             }
 
-            // Verify password
-            const isValidPassword = await bcrypt.compare(password, restaurant.adminPassword);
+            if (!user.tenant || user.tenant.status !== 'ACTIVE') {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Account pending approval or suspended.',
+                });
+            }
 
+            const isValidPassword = await bcrypt.compare(password, user.passwordHash);
             if (!isValidPassword) {
                 return res.status(401).json({
                     success: false,
@@ -52,22 +59,34 @@ router.post(
                 });
             }
 
-            // Generate JWT token
+            // Update last login
+            await prisma.user.update({
+                where: { id: user.id },
+                data: { lastLoginAt: new Date() },
+            });
+
+            // Get user's default location (first active location)
+            const defaultLocation = await prisma.location.findFirst({
+                where: { tenantId: user.tenantId, isActive: true },
+                select: { id: true, name: true },
+            });
+
             const token = jwt.sign(
                 {
-                    restaurantId: restaurant.id,
-                    email: restaurant.adminEmail,
+                    userId: user.id,
+                    tenantId: user.tenantId,
+                    role: user.role,
+                    locationId: defaultLocation?.id || null,
                 },
                 process.env.JWT_SECRET,
-                { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+                { expiresIn: user.role === 'OWNER' ? '7d' : '12h' }
             );
 
-            // Set secure cookie
             res.cookie('token', token, {
                 httpOnly: true,
                 secure: process.env.NODE_ENV === 'production',
                 sameSite: 'strict',
-                maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+                maxAge: user.role === 'OWNER' ? 7 * 24 * 60 * 60 * 1000 : 12 * 60 * 60 * 1000,
             });
 
             res.json({
@@ -75,132 +94,66 @@ router.post(
                 message: 'Login successful',
                 data: {
                     token,
-                    restaurant: {
-                        id: restaurant.id,
-                        name: restaurant.name,
-                        email: restaurant.adminEmail,
+                    user: {
+                        id: user.id,
+                        name: user.name,
+                        email: user.email,
+                        role: user.role,
+                        tenantId: user.tenantId,
+                        permissions: user.permissions.map(p => p.permission),
                     },
+                    tenant: user.tenant,
+                    location: defaultLocation,
                 },
             });
         } catch (error) {
             console.error('Login error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Login failed',
-            });
+            res.status(500).json({ success: false, message: 'Login failed' });
         }
     }
 );
-
-/**
- * POST /api/auth/register
- * Register new restaurant (for initial setup)
- */
-router.post(
-    '/register',
-    [
-        body('name').trim().isLength({ min: 2, max: 100 }).withMessage('Name must be 2-100 characters'),
-        body('email').isEmail().normalizeEmail().withMessage('Valid email required'),
-        body('password').isLength({ min: 8 }).withMessage('Password must be at least 8 characters'),
-        validate,
-    ],
-    async (req, res) => {
-        try {
-            const { name, nameFr, nameAr, email, password } = req.body;
-
-            // Check if email already exists
-            const existing = await prisma.restaurant.findUnique({
-                where: { adminEmail: email },
-            });
-
-            if (existing) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Email already registered',
-                });
-            }
-
-            // Hash password
-            const hashedPassword = await bcrypt.hash(password, 12);
-
-            // Create restaurant
-            const restaurant = await prisma.restaurant.create({
-                data: {
-                    name,
-                    nameFr,
-                    nameAr,
-                    adminEmail: email,
-                    adminPassword: hashedPassword,
-                },
-                select: {
-                    id: true,
-                    name: true,
-                    adminEmail: true,
-                    createdAt: true,
-                },
-            });
-
-            res.status(201).json({
-                success: true,
-                message: 'Restaurant registered successfully',
-                data: { restaurant },
-            });
-        } catch (error) {
-            console.error('Registration error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Registration failed',
-            });
-        }
-    }
-);
-
-/**
- * POST /api/auth/logout
- * Clear auth cookie
- */
-router.post('/logout', (req, res) => {
-    res.clearCookie('token');
-    res.json({
-        success: true,
-        message: 'Logged out successfully',
-    });
-});
 
 /**
  * POST /api/auth/staff-login
- * Staff login with PIN
+ * Quick PIN-based login for staff (Waiter, Kitchen)
  */
 router.post(
     '/staff-login',
     [
-        body('staffId').isUUID().withMessage('Valid staff ID required'),
+        body('userId').isUUID().withMessage('Valid user ID required'),
         body('pin').isLength({ min: 4, max: 6 }).isNumeric().withMessage('PIN must be 4-6 digits'),
+        body('locationId').isUUID().withMessage('Location ID required'),
         validate,
     ],
     async (req, res) => {
         try {
-            const { staffId, pin } = req.body;
+            const { userId, pin, locationId } = req.body;
 
-            const staff = await prisma.staff.findUnique({
-                where: { id: staffId },
+            const user = await prisma.user.findUnique({
+                where: { id: userId },
                 include: {
-                    restaurant: {
-                        select: { id: true, name: true, isActive: true },
+                    tenant: {
+                        select: { id: true, businessName: true, status: true },
                     },
                 },
             });
 
-            if (!staff || !staff.isActive || !staff.restaurant.isActive) {
+            if (!user || !user.isActive || !user.pin) {
                 return res.status(401).json({
                     success: false,
                     message: 'Invalid credentials',
                 });
             }
 
-            // Verify PIN
-            const isValidPin = await bcrypt.compare(pin, staff.pin);
+            if (!user.tenant || user.tenant.status !== 'ACTIVE') {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Account not active.',
+                });
+            }
 
+            // Verify PIN
+            const isValidPin = await bcrypt.compare(pin, user.pin);
             if (!isValidPin) {
                 return res.status(401).json({
                     success: false,
@@ -208,12 +161,31 @@ router.post(
                 });
             }
 
-            // Generate staff token (shorter expiry)
+            // Verify location belongs to tenant
+            const location = await prisma.location.findFirst({
+                where: { id: locationId, tenantId: user.tenantId, isActive: true },
+                select: { id: true, name: true },
+            });
+
+            if (!location) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Invalid location.',
+                });
+            }
+
+            // Update last login
+            await prisma.user.update({
+                where: { id: user.id },
+                data: { lastLoginAt: new Date() },
+            });
+
             const token = jwt.sign(
                 {
-                    staffId: staff.id,
-                    restaurantId: staff.restaurantId,
-                    role: staff.role,
+                    userId: user.id,
+                    tenantId: user.tenantId,
+                    role: user.role,
+                    locationId: location.id,
                 },
                 process.env.JWT_SECRET,
                 { expiresIn: '12h' }
@@ -224,22 +196,86 @@ router.post(
                 message: 'Staff login successful',
                 data: {
                     token,
-                    staff: {
-                        id: staff.id,
-                        name: staff.name,
-                        role: staff.role,
+                    user: {
+                        id: user.id,
+                        name: user.name,
+                        role: user.role,
+                        tenantId: user.tenantId,
                     },
-                    restaurant: staff.restaurant,
+                    tenant: user.tenant,
+                    location,
                 },
             });
         } catch (error) {
             console.error('Staff login error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Login failed',
-            });
+            res.status(500).json({ success: false, message: 'Server error' });
         }
     }
 );
+
+/**
+ * GET /api/auth/staff
+ * Get list of active staff for PIN login screen
+ * Requires locationId query parameter
+ */
+router.get('/staff', async (req, res) => {
+    try {
+        const { locationId } = req.query;
+
+        if (!locationId) {
+            return res.status(400).json({
+                success: false,
+                message: 'locationId query parameter required',
+            });
+        }
+
+        // Get the tenant from the location
+        const location = await prisma.location.findUnique({
+            where: { id: locationId },
+            select: { tenantId: true, isActive: true },
+        });
+
+        if (!location || !location.isActive) {
+            return res.status(404).json({
+                success: false,
+                message: 'Location not found',
+            });
+        }
+
+        const staff = await prisma.user.findMany({
+            where: {
+                tenantId: location.tenantId,
+                isActive: true,
+                pin: { not: null }, // Only staff with PIN set
+                role: { in: ['WAITER', 'KITCHEN', 'MANAGER', 'STAFF'] },
+            },
+            select: {
+                id: true,
+                name: true,
+                role: true,
+            },
+            orderBy: { name: 'asc' },
+        });
+
+        res.json({
+            success: true,
+            data: { staff },
+        });
+    } catch (error) {
+        console.error('Fetch staff error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch staff list',
+        });
+    }
+});
+
+/**
+ * POST /api/auth/logout
+ */
+router.post('/logout', (req, res) => {
+    res.clearCookie('token');
+    res.json({ success: true, message: 'Logged out successfully' });
+});
 
 export default router;

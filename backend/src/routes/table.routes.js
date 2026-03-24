@@ -1,23 +1,31 @@
 import express from 'express';
 import { body, param } from 'express-validator';
-import bcrypt from 'bcryptjs';
 import { validate } from '../middleware/validation.js';
 import { verifyToken } from '../middleware/auth.js';
+import { tenantScope } from '../middleware/tenantScope.js';
+import { checkPermission } from '../middleware/rbac.js';
 import prisma from '../config/database.js';
 
 const router = express.Router();
 
 /**
  * GET /api/tables
- * Get all tables for restaurant (admin)
+ * Get all tables for current location (admin)
  */
 router.get(
     '/',
     verifyToken,
+    tenantScope,
+    checkPermission('tables:read'),
     async (req, res) => {
         try {
+            const locationId = req.locationId;
+            if (!locationId) {
+                return res.status(400).json({ success: false, message: 'Location ID required' });
+            }
+
             const tables = await prisma.table.findMany({
-                where: { restaurantId: req.restaurantId },
+                where: { locationId },
                 include: {
                     qrTokens: {
                         orderBy: { createdAt: 'desc' },
@@ -26,9 +34,7 @@ router.get(
                     _count: {
                         select: {
                             orders: {
-                                where: {
-                                    status: { notIn: ['DELIVERED', 'CANCELLED'] },
-                                },
+                                where: { status: { notIn: ['DELIVERED', 'CANCELLED'] } },
                             },
                         },
                     },
@@ -36,24 +42,21 @@ router.get(
                 orderBy: { tableNumber: 'asc' },
             });
 
-            const baseUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+            const apiBaseUrl = process.env.API_URL || 'http://localhost:5000';
 
             const tablesWithQR = await Promise.all(tables.map(async (table) => {
                 const activeToken = table.qrTokens[0];
-                let qrCodes = [];
-
-                // Always provide a QR code image for the table (Permanent QR)
-                const apiBaseUrl = process.env.API_URL || 'http://192.168.137.1:5000';
                 const qrUrl = `${apiBaseUrl}/api/qr/scan/${table.id}`;
-                const qrDataUrl = await (async () => {
-                    try {
-                        const QRCode = (await import('qrcode')).default;
-                        return await QRCode.toDataURL(qrUrl, { width: 400, margin: 2 });
-                    } catch (e) {
-                        return null;
-                    }
-                })();
+                let qrDataUrl = null;
 
+                try {
+                    const QRCode = (await import('qrcode')).default;
+                    qrDataUrl = await QRCode.toDataURL(qrUrl, { width: 400, margin: 2 });
+                } catch (e) {
+                    // QR generation failed
+                }
+
+                let qrCodes = [];
                 if (activeToken) {
                     qrCodes = [{
                         id: activeToken.id,
@@ -61,37 +64,26 @@ router.get(
                         qrUrl,
                         qrDataUrl,
                         expiresAt: activeToken.expiresAt,
-                        active: new Date(activeToken.expiresAt) > new Date()
+                        active: new Date(activeToken.expiresAt) > new Date(),
                     }];
                 } else {
-                    // Even if no token, provide the QR image so Admin can always "View QR"
                     qrCodes = [{
                         id: 'stable',
                         token: 'stable',
                         qrUrl,
                         qrDataUrl,
-                        expiresAt: new Date(0).toISOString(), // Expired
-                        active: false
+                        expiresAt: new Date(0).toISOString(),
+                        active: false,
                     }];
                 }
 
-                return {
-                    ...table,
-                    qrCodes,
-                    qrTokens: undefined // Clean up
-                };
+                return { ...table, qrCodes, qrTokens: undefined };
             }));
 
-            res.json({
-                success: true,
-                data: { tables: tablesWithQR },
-            });
+            res.json({ success: true, data: { tables: tablesWithQR } });
         } catch (error) {
             console.error('Get tables error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Failed to fetch tables',
-            });
+            res.status(500).json({ success: false, message: 'Failed to fetch tables' });
         }
     }
 );
@@ -103,22 +95,25 @@ router.get(
 router.post(
     '/',
     verifyToken,
+    tenantScope,
+    checkPermission('tables:manage'),
     [
-        body('tableNumber').isInt({ min: 1, max: 999 }).withMessage('Table number must be 1-999'),
+        body('tableNumber').isInt({ min: 1, max: 999 }),
         body('tableName').optional().trim().isLength({ max: 50 }),
         body('capacity').optional().isInt({ min: 1, max: 50 }),
         validate,
     ],
     async (req, res) => {
         try {
+            const locationId = req.locationId;
+            if (!locationId) {
+                return res.status(400).json({ success: false, message: 'Location ID required' });
+            }
+
             const { tableNumber, tableName, capacity } = req.body;
 
-            // Check if table number already exists
             const existing = await prisma.table.findFirst({
-                where: {
-                    restaurantId: req.restaurantId,
-                    tableNumber,
-                },
+                where: { locationId, tableNumber },
             });
 
             if (existing) {
@@ -129,25 +124,13 @@ router.post(
             }
 
             const table = await prisma.table.create({
-                data: {
-                    restaurantId: req.restaurantId,
-                    tableNumber,
-                    tableName,
-                    capacity: capacity || 4,
-                },
+                data: { locationId, tableNumber, tableName, capacity: capacity || 4 },
             });
 
-            res.status(201).json({
-                success: true,
-                message: 'Table created',
-                data: { table },
-            });
+            res.status(201).json({ success: true, message: 'Table created', data: { table } });
         } catch (error) {
             console.error('Create table error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Failed to create table',
-            });
+            res.status(500).json({ success: false, message: 'Failed to create table' });
         }
     }
 );
@@ -159,6 +142,8 @@ router.post(
 router.put(
     '/:tableId',
     verifyToken,
+    tenantScope,
+    checkPermission('tables:manage'),
     [
         param('tableId').isUUID(),
         body('tableName').optional().trim().isLength({ max: 50 }),
@@ -171,16 +156,12 @@ router.put(
             const { tableId } = req.params;
             const { tableName, capacity, isActive } = req.body;
 
-            // Verify table belongs to restaurant
             const table = await prisma.table.findFirst({
-                where: { id: tableId, restaurantId: req.restaurantId },
+                where: { id: tableId, locationId: req.locationId },
             });
 
             if (!table) {
-                return res.status(404).json({
-                    success: false,
-                    message: 'Table not found',
-                });
+                return res.status(404).json({ success: false, message: 'Table not found' });
             }
 
             const updated = await prisma.table.update({
@@ -188,62 +169,40 @@ router.put(
                 data: { tableName, capacity, isActive },
             });
 
-            res.json({
-                success: true,
-                message: 'Table updated',
-                data: { table: updated },
-            });
+            res.json({ success: true, message: 'Table updated', data: { table: updated } });
         } catch (error) {
             console.error('Update table error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Failed to update table',
-            });
+            res.status(500).json({ success: false, message: 'Failed to update table' });
         }
     }
 );
 
 /**
  * DELETE /api/tables/:tableId
- * Delete table (admin)
  */
 router.delete(
     '/:tableId',
     verifyToken,
-    [
-        param('tableId').isUUID(),
-        validate,
-    ],
+    tenantScope,
+    checkPermission('tables:manage'),
+    [param('tableId').isUUID(), validate],
     async (req, res) => {
         try {
             const { tableId } = req.params;
 
-            // Verify table belongs to restaurant
             const table = await prisma.table.findFirst({
-                where: { id: tableId, restaurantId: req.restaurantId },
+                where: { id: tableId, locationId: req.locationId },
             });
 
             if (!table) {
-                return res.status(404).json({
-                    success: false,
-                    message: 'Table not found',
-                });
+                return res.status(404).json({ success: false, message: 'Table not found' });
             }
 
-            await prisma.table.delete({
-                where: { id: tableId },
-            });
-
-            res.json({
-                success: true,
-                message: 'Table deleted',
-            });
+            await prisma.table.delete({ where: { id: tableId } });
+            res.json({ success: true, message: 'Table deleted' });
         } catch (error) {
             console.error('Delete table error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Failed to delete table',
-            });
+            res.status(500).json({ success: false, message: 'Failed to delete table' });
         }
     }
 );

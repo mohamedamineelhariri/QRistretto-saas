@@ -2,8 +2,9 @@ import jwt from 'jsonwebtoken';
 import prisma from '../config/database.js';
 
 /**
- * Verify JWT token for admin routes
- * Security: Token validation with proper error handling
+ * Verify JWT token for authenticated routes.
+ * Supports both admin (User) tokens and legacy staff tokens.
+ * Sets: req.userId, req.tenantId, req.userRole, req.userPermissions, req.locationId
  */
 export const verifyToken = async (req, res, next) => {
     try {
@@ -27,22 +28,54 @@ export const verifyToken = async (req, res, next) => {
         // Verify token
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-        // Check if restaurant still exists and is active
-        const restaurant = await prisma.restaurant.findUnique({
-            where: { id: decoded.restaurantId },
-            select: { id: true, isActive: true, name: true },
+        // Token contains: { userId, tenantId, role, locationId? }
+        const user = await prisma.user.findUnique({
+            where: { id: decoded.userId },
+            select: {
+                id: true,
+                tenantId: true,
+                email: true,
+                name: true,
+                role: true,
+                isActive: true,
+                permissions: {
+                    select: { permission: true },
+                },
+                tenant: {
+                    select: {
+                        id: true,
+                        status: true,
+                        businessName: true,
+                    },
+                },
+            },
         });
 
-        if (!restaurant || !restaurant.isActive) {
+        if (!user || !user.isActive) {
             return res.status(401).json({
                 success: false,
-                message: 'Restaurant not found or inactive.',
+                message: 'User not found or inactive.',
             });
         }
 
-        // Attach restaurant info to request
-        req.restaurant = restaurant;
-        req.restaurantId = decoded.restaurantId;
+        if (!user.tenant || user.tenant.status !== 'ACTIVE') {
+            return res.status(401).json({
+                success: false,
+                message: 'Tenant not active. Contact support.',
+            });
+        }
+
+        // Attach auth context to request
+        req.userId = user.id;
+        req.tenantId = user.tenantId;
+        req.userRole = user.role;
+        req.userEmail = user.email;
+        req.userName = user.name;
+        req.userPermissions = user.permissions.map(p => p.permission);
+        req.tenant = user.tenant;
+
+        // Location context — from token or header
+        req.locationId = decoded.locationId || req.headers['x-location-id'] || null;
 
         next();
     } catch (error) {
@@ -69,48 +102,56 @@ export const verifyToken = async (req, res, next) => {
 };
 
 /**
- * Verify staff PIN for waiter/kitchen access
+ * Verify Super Admin token (separate auth domain)
  */
-export const verifyStaffPin = async (req, res, next) => {
+export const verifySuperAdmin = async (req, res, next) => {
     try {
-        const { staffId, pin } = req.body;
+        const authHeader = req.headers.authorization;
+        let token = null;
 
-        if (!staffId || !pin) {
-            return res.status(400).json({
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+            token = authHeader.substring(7);
+        }
+
+        if (!token) {
+            return res.status(401).json({
                 success: false,
-                message: 'Staff ID and PIN required.',
+                message: 'Access denied. Super Admin token required.',
             });
         }
 
-        const staff = await prisma.staff.findUnique({
-            where: { id: staffId },
-            include: { restaurant: { select: { id: true, isActive: true } } },
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+        if (decoded.type !== 'super_admin') {
+            return res.status(403).json({
+                success: false,
+                message: 'Super Admin access required.',
+            });
+        }
+
+        const admin = await prisma.superAdmin.findUnique({
+            where: { id: decoded.adminId },
+            select: { id: true, email: true, name: true, isActive: true },
         });
 
-        if (!staff || !staff.isActive || !staff.restaurant.isActive) {
+        if (!admin || !admin.isActive) {
             return res.status(401).json({
                 success: false,
-                message: 'Invalid credentials.',
+                message: 'Super Admin not found or inactive.',
             });
         }
 
-        // Compare PIN (stored hashed)
-        const bcrypt = await import('bcryptjs');
-        const isValidPin = await bcrypt.compare(pin, staff.pin);
-
-        if (!isValidPin) {
-            return res.status(401).json({
-                success: false,
-                message: 'Invalid credentials.',
-            });
-        }
-
-        req.staff = staff;
-        req.restaurantId = staff.restaurantId;
-
+        req.superAdmin = admin;
         next();
     } catch (error) {
-        console.error('Staff auth error:', error);
+        if (error.name === 'TokenExpiredError' || error.name === 'JsonWebTokenError') {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid or expired token.',
+            });
+        }
+
+        console.error('Super Admin auth error:', error);
         return res.status(500).json({
             success: false,
             message: 'Authentication error.',
@@ -119,7 +160,7 @@ export const verifyStaffPin = async (req, res, next) => {
 };
 
 /**
- * Optional auth - attaches restaurant if token present, but doesn't require it
+ * Optional auth — attaches user info if token present, doesn't require it
  */
 export const optionalAuth = async (req, res, next) => {
     try {
@@ -128,10 +169,13 @@ export const optionalAuth = async (req, res, next) => {
         if (authHeader && authHeader.startsWith('Bearer ')) {
             const token = authHeader.substring(7);
             const decoded = jwt.verify(token, process.env.JWT_SECRET);
-            req.restaurantId = decoded.restaurantId;
+            req.userId = decoded.userId;
+            req.tenantId = decoded.tenantId;
+            req.userRole = decoded.role;
+            req.locationId = decoded.locationId || null;
         }
     } catch (error) {
-        // Token invalid or missing - that's okay for optional auth
+        // Token invalid or missing — acceptable for optional auth
     }
 
     next();

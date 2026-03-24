@@ -1,137 +1,136 @@
 import prisma from '../config/database.js';
 
 /**
- * Parse CIDR notation and check if IP is in range
- * Example: isIPInRange("192.168.1.50", "192.168.1.0/24") => true
- */
-function isIPInRange(ip, cidr) {
-    // Handle IPv4-mapped IPv6 addresses
-    if (ip.startsWith('::ffff:')) {
-        ip = ip.substring(7);
-    }
-
-    // Handle localhost
-    if (ip === '::1' || ip === '127.0.0.1' || ip === 'localhost') {
-        // In development, always allow localhost
-        if (process.env.NODE_ENV === 'development') {
-            return true;
-        }
-    }
-
-    const [range, bits] = cidr.split('/');
-    const mask = parseInt(bits, 10);
-
-    // Convert IP addresses to numbers
-    const ipParts = ip.split('.').map(Number);
-    const rangeParts = range.split('.').map(Number);
-
-    if (ipParts.length !== 4 || rangeParts.length !== 4) {
-        return false;
-    }
-
-    const ipNum = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
-    const rangeNum = (rangeParts[0] << 24) + (rangeParts[1] << 16) + (rangeParts[2] << 8) + rangeParts[3];
-
-    // Create mask
-    const maskNum = ~((1 << (32 - mask)) - 1);
-
-    return (ipNum & maskNum) === (rangeNum & maskNum);
-}
-
-/**
- * Get client IP address from request
- * Handles proxies and various header formats
- */
-function getClientIP(req) {
-    // Check various headers (in order of preference)
-    const forwardedFor = req.headers['x-forwarded-for'];
-    if (forwardedFor) {
-        // Take first IP if multiple
-        return forwardedFor.split(',')[0].trim();
-    }
-
-    const realIP = req.headers['x-real-ip'];
-    if (realIP) {
-        return realIP;
-    }
-
-    // Fall back to connection remote address
-    return req.connection?.remoteAddress || req.socket?.remoteAddress || req.ip;
-}
-
-/**
- * Middleware: Validate customer is on restaurant Wi-Fi
- * Security: Strict IP validation with multi-network support
+ * WiFi Validation Middleware
+ * Validates that the customer is on the restaurant's WiFi network.
+ * Updated for multi-tenant: uses locationId instead of restaurantId.
+ * 
+ * WiFi validation can be enabled/disabled per-location via settings.
  */
 export const validateWifi = async (req, res, next) => {
     try {
-        const { restaurantId } = req.params;
+        // Get client IP address
+        const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+                         req.connection?.remoteAddress ||
+                         req.socket?.remoteAddress ||
+                         '127.0.0.1';
 
-        if (!restaurantId) {
-            return res.status(400).json({
-                success: false,
-                message: 'Restaurant ID required.',
-            });
+        // Normalize IPv6 localhost to IPv4
+        const normalizedIp = clientIp === '::1' ? '127.0.0.1' : clientIp;
+
+        // Store for downstream use
+        req.clientIp = normalizedIp;
+
+        // If in development and connecting from localhost, skip validation
+        if (process.env.NODE_ENV === 'development' && 
+            (normalizedIp === '127.0.0.1' || normalizedIp === '::1' || normalizedIp.startsWith('192.168.'))) {
+            return next();
         }
 
-        // Get all active Wi-Fi networks for this restaurant
-        const networks = await prisma.wifiNetwork.findMany({
-            where: {
-                restaurantId,
-                isActive: true,
+        // Determine the locationId from various sources
+        const { tableId } = req.params;
+        const token = req.body?.token || req.query?.token;
+        let locationId = req.locationId || null;
+
+        // Priority 1: Direct locationId from auth
+        // Priority 2: From table lookup
+        if (!locationId && tableId) {
+            const table = await prisma.table.findUnique({
+                where: { id: tableId },
+                select: { locationId: true },
+            });
+            if (table) locationId = table.locationId;
+        }
+
+        // Priority 3: From QR token lookup
+        if (!locationId && token) {
+            const qrToken = await prisma.qRToken.findFirst({
+                where: { token },
+                include: { table: { select: { locationId: true } } },
+            });
+            if (qrToken) locationId = qrToken.table.locationId;
+        }
+
+        if (!locationId) {
+            // Cannot determine location — skip WiFi check but log warning
+            console.warn('[WiFi] Cannot determine location for WiFi validation');
+            return next();
+        }
+
+        // Get location settings
+        const location = await prisma.location.findUnique({
+            where: { id: locationId },
+            select: {
+                settings: true,
+                wifiNetworks: true,
             },
         });
 
-        if (networks.length === 0) {
-            // No networks configured - allow in development, block in production
-            if (process.env.NODE_ENV === 'development') {
-                console.warn('⚠️ No Wi-Fi networks configured - allowing in dev mode');
-                return next();
-            }
-
-            return res.status(403).json({
-                success: false,
-                message: 'Wi-Fi validation not configured.',
-                code: 'WIFI_NOT_CONFIGURED',
-            });
+        if (!location) {
+            return next();
         }
 
-        const clientIP = getClientIP(req);
-        console.log(`🔍 Checking IP: ${clientIP}`);
+        // Check if WiFi validation is enabled
+        const settings = location.settings || {};
+        if (!settings.wifiValidationEnabled) {
+            // WiFi validation disabled — allow all
+            req.locationId = locationId;
+            return next();
+        }
 
-        // Check if client IP matches any configured network
-        const isValidNetwork = networks.some(network => {
-            const isInRange = isIPInRange(clientIP, network.ipRange);
-            console.log(`   Checking ${network.networkName} (${network.ipRange}): ${isInRange}`);
-            return isInRange;
-        });
+        // Get configured WiFi networks for this location
+        const networks = location.wifiNetworks;
+        if (!networks || networks.length === 0) {
+            // No networks configured — skip validation
+            req.locationId = locationId;
+            return next();
+        }
 
-        if (!isValidNetwork) {
+        // Check if client IP is in any of the configured networks
+        const isOnWifi = networks.some(network => isIpInRange(normalizedIp, network.ipRange));
+
+        if (!isOnWifi) {
             return res.status(403).json({
                 success: false,
-                message: 'Please connect to the restaurant Wi-Fi to place your order.',
-                messageAr: 'يرجى الاتصال بشبكة Wi-Fi الخاصة بالمطعم لتقديم طلبك.',
-                messageFr: 'Veuillez vous connecter au Wi-Fi du restaurant pour passer votre commande.',
+                message: 'Please connect to the restaurant WiFi to place an order.',
+                messageAr: 'يرجى الاتصال بشبكة WiFi الخاصة بالمطعم لتقديم طلب.',
+                messageFr: 'Veuillez vous connecter au WiFi du restaurant pour passer commande.',
                 code: 'WIFI_REQUIRED',
+                clientIp: normalizedIp,
+                locationId,
             });
         }
 
-        // Valid - attach network info to request
-        req.clientIP = clientIP;
+        req.locationId = locationId;
         next();
     } catch (error) {
-        console.error('Wi-Fi validation error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Wi-Fi validation error.',
-        });
+        console.error('[WiFi Validation Error]:', error);
+        // Fail open — don't block orders if WiFi check fails
+        next();
     }
 };
 
 /**
- * Skip Wi-Fi validation for staff routes (they have PIN auth)
+ * Check if an IP address is within a CIDR range
  */
-export const skipWifiForStaff = (req, res, next) => {
-    // Staff routes bypass Wi-Fi check
-    next();
-};
+function isIpInRange(ip, cidr) {
+    try {
+        const [range, bits] = cidr.split('/');
+        const mask = ~(Math.pow(2, 32 - parseInt(bits)) - 1);
+
+        const ipNum = ipToNumber(ip);
+        const rangeNum = ipToNumber(range);
+
+        return (ipNum & mask) === (rangeNum & mask);
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * Convert IP address to number
+ */
+function ipToNumber(ip) {
+    return ip.split('.')
+        .reduce((acc, octet) => (acc << 8) + parseInt(octet), 0) >>> 0;
+}

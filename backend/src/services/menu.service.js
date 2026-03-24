@@ -1,12 +1,13 @@
 import prisma from '../config/database.js';
 
 /**
- * Get menu items for a restaurant, grouped by category
+ * Get menu items for a location, grouped by category
+ * (Renamed from getMenuByRestaurant → getMenuByLocation)
  */
-export async function getMenuByRestaurant(restaurantId, locale = 'en') {
+export async function getMenuByLocation(locationId, locale = 'en') {
     const items = await prisma.menuItem.findMany({
         where: {
-            restaurantId,
+            locationId,
             available: true,
         },
         orderBy: [
@@ -20,7 +21,6 @@ export async function getMenuByRestaurant(restaurantId, locale = 'en') {
     const grouped = {};
 
     items.forEach(item => {
-        // Get localized category name
         let categoryName = item.category;
         if (locale === 'fr' && item.categoryFr) categoryName = item.categoryFr;
         if (locale === 'ar' && item.categoryAr) categoryName = item.categoryAr;
@@ -35,7 +35,6 @@ export async function getMenuByRestaurant(restaurantId, locale = 'en') {
             };
         }
 
-        // Get localized item name and description
         let name = item.name;
         let description = item.description;
 
@@ -66,12 +65,20 @@ export async function getMenuByRestaurant(restaurantId, locale = 'en') {
     return Object.values(grouped);
 }
 
+// Backward-compatible alias
+export const getMenuByRestaurant = getMenuByLocation;
+
 /**
  * Get all menu items for admin (including unavailable)
  */
-export async function getAllMenuItems(restaurantId) {
+export async function getAllMenuItems(locationId) {
     return prisma.menuItem.findMany({
-        where: { restaurantId },
+        where: { locationId },
+        include: {
+            recipeItems: {
+                include: { inventoryItem: true },
+            },
+        },
         orderBy: [
             { category: 'asc' },
             { sortOrder: 'asc' },
@@ -82,23 +89,36 @@ export async function getAllMenuItems(restaurantId) {
 /**
  * Create a new menu item
  */
-export async function createMenuItem(restaurantId, data) {
+export async function createMenuItem(locationId, data) {
+    const { recipeItems, ...menuData } = data;
+
     return prisma.menuItem.create({
         data: {
-            restaurantId,
-            name: data.name,
-            nameFr: data.nameFr,
-            nameAr: data.nameAr,
-            description: data.description,
-            descriptionFr: data.descriptionFr,
-            descriptionAr: data.descriptionAr,
-            category: data.category,
-            categoryFr: data.categoryFr,
-            categoryAr: data.categoryAr,
-            price: data.price,
-            imageUrl: data.imageUrl,
-            available: data.available ?? true,
-            sortOrder: data.sortOrder ?? 0,
+            locationId,
+            name: menuData.name,
+            nameFr: menuData.nameFr,
+            nameAr: menuData.nameAr,
+            description: menuData.description,
+            descriptionFr: menuData.descriptionFr,
+            descriptionAr: menuData.descriptionAr,
+            category: menuData.category,
+            categoryFr: menuData.categoryFr,
+            categoryAr: menuData.categoryAr,
+            price: menuData.price,
+            imageUrl: menuData.imageUrl,
+            available: menuData.available ?? true,
+            sortOrder: menuData.sortOrder ?? 0,
+            prepTimeMinutes: menuData.prepTimeMinutes,
+            calories: menuData.calories,
+            recipeItems: recipeItems ? {
+                create: recipeItems.map(item => ({
+                    inventoryItemId: item.inventoryItemId,
+                    quantity: item.quantity,
+                })),
+            } : undefined,
+        },
+        include: {
+            recipeItems: { include: { inventoryItem: true } },
         },
     });
 }
@@ -106,32 +126,50 @@ export async function createMenuItem(restaurantId, data) {
 /**
  * Update a menu item
  */
-export async function updateMenuItem(itemId, restaurantId, data) {
-    // Verify item belongs to restaurant
+export async function updateMenuItem(itemId, locationId, data) {
     const item = await prisma.menuItem.findFirst({
-        where: { id: itemId, restaurantId },
+        where: { id: itemId, locationId },
     });
 
     if (!item) {
         throw new Error('Menu item not found');
     }
 
+    const { recipeItems, ...menuData } = data;
+
+    if (recipeItems !== undefined) {
+        await prisma.recipeItem.deleteMany({
+            where: { menuItemId: itemId },
+        });
+    }
+
     return prisma.menuItem.update({
         where: { id: itemId },
         data: {
-            name: data.name,
-            nameFr: data.nameFr,
-            nameAr: data.nameAr,
-            description: data.description,
-            descriptionFr: data.descriptionFr,
-            descriptionAr: data.descriptionAr,
-            category: data.category,
-            categoryFr: data.categoryFr,
-            categoryAr: data.categoryAr,
-            price: data.price,
-            imageUrl: data.imageUrl,
-            available: data.available,
-            sortOrder: data.sortOrder,
+            name: menuData.name,
+            nameFr: menuData.nameFr,
+            nameAr: menuData.nameAr,
+            description: menuData.description,
+            descriptionFr: menuData.descriptionFr,
+            descriptionAr: menuData.descriptionAr,
+            category: menuData.category,
+            categoryFr: menuData.categoryFr,
+            categoryAr: menuData.categoryAr,
+            price: menuData.price,
+            imageUrl: menuData.imageUrl,
+            available: menuData.available,
+            sortOrder: menuData.sortOrder,
+            prepTimeMinutes: menuData.prepTimeMinutes,
+            calories: menuData.calories,
+            recipeItems: recipeItems ? {
+                create: recipeItems.map(item => ({
+                    inventoryItemId: item.inventoryItemId,
+                    quantity: item.quantity,
+                })),
+            } : undefined,
+        },
+        include: {
+            recipeItems: { include: { inventoryItem: true } },
         },
     });
 }
@@ -139,9 +177,9 @@ export async function updateMenuItem(itemId, restaurantId, data) {
 /**
  * Toggle menu item availability
  */
-export async function toggleItemAvailability(itemId, restaurantId) {
+export async function toggleItemAvailability(itemId, locationId) {
     const item = await prisma.menuItem.findFirst({
-        where: { id: itemId, restaurantId },
+        where: { id: itemId, locationId },
     });
 
     if (!item) {
@@ -157,26 +195,24 @@ export async function toggleItemAvailability(itemId, restaurantId) {
 /**
  * Delete a menu item
  */
-export async function deleteMenuItem(itemId, restaurantId) {
+export async function deleteMenuItem(itemId, locationId) {
     const item = await prisma.menuItem.findFirst({
-        where: { id: itemId, restaurantId },
+        where: { id: itemId, locationId },
     });
 
     if (!item) {
         throw new Error('Menu item not found');
     }
 
-    return prisma.menuItem.delete({
-        where: { id: itemId },
-    });
+    return prisma.menuItem.delete({ where: { id: itemId } });
 }
 
 /**
- * Get unique categories for a restaurant
+ * Get unique categories for a location
  */
-export async function getCategories(restaurantId) {
-    const items = await prisma.menuItem.findMany({
-        where: { restaurantId },
+export async function getCategories(locationId) {
+    return prisma.menuItem.findMany({
+        where: { locationId },
         select: {
             category: true,
             categoryFr: true,
@@ -184,6 +220,4 @@ export async function getCategories(restaurantId) {
         },
         distinct: ['category'],
     });
-
-    return items;
 }

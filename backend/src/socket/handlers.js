@@ -1,58 +1,73 @@
+import jwt from 'jsonwebtoken';
+
 /**
- * Socket.io Event Handlers
- * Real-time communication for orders and menu updates
+ * Setup Socket.IO event handlers with JWT authentication
+ * Updated for multi-tenant architecture: uses locationId instead of restaurantId
  */
-
 export function setupSocketHandlers(io) {
+    // Authenticate all socket connections
+    io.use((socket, next) => {
+        try {
+            const token = socket.handshake.auth?.token;
+            if (!token) {
+                return next(new Error('Authentication required'));
+            }
+
+            const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+            // Attach user info to socket
+            socket.data = {
+                userId: decoded.userId,
+                tenantId: decoded.tenantId,
+                locationId: decoded.locationId,
+                role: decoded.role,
+            };
+
+            next();
+        } catch (error) {
+            return next(new Error('Invalid token'));
+        }
+    });
+
     io.on('connection', (socket) => {
-        console.log(`📡 Socket connected: ${socket.id}`);
+        console.log(`🔌 Socket connected: ${socket.id} (user: ${socket.data.userId || 'unknown'})`);
 
-        // Join restaurant room (for staff dashboards)
-        socket.on('join:restaurant', (restaurantId) => {
-            if (restaurantId) {
-                socket.join(`restaurant:${restaurantId}`);
-                console.log(`   Joined restaurant room: ${restaurantId}`);
+        // Join restaurant room (location-scoped)
+        socket.on('join:restaurant', (locationId) => {
+            // Security: Only allow joining the location from the token
+            if (!locationId) {
+                socket.emit('error', { message: 'Location ID required' });
+                return;
             }
+
+            if (socket.data.locationId !== locationId) {
+                socket.emit('error', { message: 'Unauthorized: location mismatch' });
+                return;
+            }
+
+            socket.join(`restaurant:${locationId}`);
+            console.log(`   ✅ Joined location room: ${locationId} (user: ${socket.data.userId})`);
         });
 
-        // Join order room (for customer tracking)
+        // Join order room (for customer order tracking)
         socket.on('join:order', (orderId) => {
-            if (orderId) {
-                socket.join(`order:${orderId}`);
-                console.log(`   Joined order room: ${orderId}`);
-            }
+            if (!orderId) return;
+            socket.join(`order:${orderId}`);
+            console.log(`   📦 Joined order room: ${orderId}`);
         });
 
-        // Leave rooms
-        socket.on('leave:restaurant', (restaurantId) => {
-            socket.leave(`restaurant:${restaurantId}`);
+        // Leave restaurant room
+        socket.on('leave:restaurant', (locationId) => {
+            socket.leave(`restaurant:${locationId}`);
         });
 
+        // Leave order room
         socket.on('leave:order', (orderId) => {
             socket.leave(`order:${orderId}`);
         });
 
-        // Handle disconnection
         socket.on('disconnect', () => {
-            console.log(`📡 Socket disconnected: ${socket.id}`);
-        });
-
-        // Error handling
-        socket.on('error', (error) => {
-            console.error('Socket error:', error);
+            console.log(`🔌 Socket disconnected: ${socket.id}`);
         });
     });
-
-    // Log socket.io server status
-    console.log('🔌 Socket.io handlers initialized');
 }
-
-/**
- * Events emitted by the server:
- * 
- * order:new      - New order created (to restaurant room)
- * order:updated  - Order status changed (to restaurant room)
- * order:status   - Order status for customer (to order room)
- * menu:updated   - Menu item availability changed (to restaurant room)
- * qr:refreshed   - QR codes refreshed (to restaurant room)
- */

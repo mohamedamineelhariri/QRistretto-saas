@@ -1,294 +1,235 @@
+/**
+ * Database Seed — SaaS Plans + Super Admin
+ * 
+ * Run with: node prisma/seed.js
+ */
+
 import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 
 const prisma = new PrismaClient();
 
 async function main() {
-    console.log('🌱 Seeding database...\n');
+    console.log('🌱 Seeding database...');
 
-    // Create demo restaurant
-    const hashedPassword = await bcrypt.hash('admin123', 12);
+    // ============================================
+    // 1. SEED PLANS
+    // ============================================
+    const plans = [
+        {
+            name: 'STARTER',
+            displayName: 'Starter',
+            displayNameFr: 'Débutant',
+            displayNameAr: 'المبتدئ',
+            priceMAD: 14900, // 149 MAD
+            maxOrdersPerDay: 150,
+            maxStaff: 3,
+            maxLocations: 1,
+            features: ['qr_menu', 'kitchen_dashboard', 'basic_orders'],
+            sortOrder: 1,
+        },
+        {
+            name: 'PRO',
+            displayName: 'Pro',
+            displayNameFr: 'Professionnel',
+            displayNameAr: 'المحترف',
+            priceMAD: 39900, // 399 MAD
+            maxOrdersPerDay: null, // unlimited
+            maxStaff: 15,
+            maxLocations: 1,
+            features: [
+                'qr_menu', 'kitchen_dashboard', 'basic_orders',
+                'whatsapp_bot', 'inventory_alerts', 'unlimited_orders',
+            ],
+            sortOrder: 2,
+        },
+        {
+            name: 'ENTERPRISE',
+            displayName: 'Enterprise',
+            displayNameFr: 'Entreprise',
+            displayNameAr: 'المؤسسة',
+            priceMAD: 89900, // 899 MAD
+            maxOrdersPerDay: null, // unlimited
+            maxStaff: null, // unlimited
+            maxLocations: 100, // essentially unlimited
+            features: [
+                'qr_menu', 'kitchen_dashboard', 'basic_orders',
+                'whatsapp_bot', 'inventory_alerts', 'unlimited_orders',
+                'multi_location', 'pdf_reports', 'support_tickets', 'unlimited_staff',
+            ],
+            sortOrder: 3,
+        },
+    ];
 
-    const restaurant = await prisma.restaurant.upsert({
-        where: { adminEmail: 'admin@cafedemo.ma' },
-        update: {},
+    for (const plan of plans) {
+        await prisma.plan.upsert({
+            where: { name: plan.name },
+            update: plan,
+            create: plan,
+        });
+        console.log(`  ✅ Plan: ${plan.name} (${plan.priceMAD / 100} MAD/mo)`);
+    }
+
+    // ============================================
+    // 2. SEED SUPER ADMIN
+    // ============================================
+    const superAdminEmail = process.env.SUPER_ADMIN_EMAIL || 'admin@qristretto.com';
+    const superAdminPassword = process.env.SUPER_ADMIN_PASSWORD || 'SuperAdmin@2026!';
+
+    const passwordHash = await bcrypt.hash(superAdminPassword, 12);
+
+    await prisma.superAdmin.upsert({
+        where: { email: superAdminEmail },
+        update: { passwordHash },
         create: {
-            name: 'Café Demo',
-            nameFr: 'Café Démo',
-            nameAr: 'مقهى ديمو',
-            adminEmail: 'admin@cafedemo.ma',
-            adminPassword: hashedPassword,
+            email: superAdminEmail,
+            passwordHash,
+            name: 'Super Admin',
         },
     });
 
-    console.log(`✅ Restaurant: ${restaurant.name}`);
+    console.log(`  ✅ Super Admin: ${superAdminEmail}`);
 
-    // Add WiFi networks
-    await prisma.wifiNetwork.deleteMany({ where: { restaurantId: restaurant.id } });
+    // ============================================
+    // 3. SEED DEMO TENANT (for development only)
+    // ============================================
+    if (process.env.NODE_ENV === 'development') {
+        const demoOwnerPassword = await bcrypt.hash('demo12345', 12);
+        const demoStaffPin = await bcrypt.hash('1234', 12);
 
-    const networks = await prisma.wifiNetwork.createMany({
-        data: [
-            { restaurantId: restaurant.id, networkName: 'CafeDemo_5G', ipRange: '192.168.1.0/24', networkType: '5G' },
-            { restaurantId: restaurant.id, networkName: 'CafeDemo_2.4G', ipRange: '192.168.2.0/24', networkType: '2.4G' },
-            { restaurantId: restaurant.id, networkName: 'CafeDemo_Guest', ipRange: '10.0.0.0/24', networkType: 'guest' },
-        ],
-    });
+        const starterPlan = await prisma.plan.findUnique({ where: { name: 'STARTER' } });
 
-    console.log(`✅ WiFi Networks: ${networks.count} created`);
-
-    // Create tables
-    await prisma.table.deleteMany({ where: { restaurantId: restaurant.id } });
-
-    const tables = await prisma.table.createMany({
-        data: [
-            { restaurantId: restaurant.id, tableNumber: 1, tableName: 'Window 1', capacity: 2 },
-            { restaurantId: restaurant.id, tableNumber: 2, tableName: 'Window 2', capacity: 2 },
-            { restaurantId: restaurant.id, tableNumber: 3, capacity: 4 },
-            { restaurantId: restaurant.id, tableNumber: 4, capacity: 4 },
-            { restaurantId: restaurant.id, tableNumber: 5, tableName: 'Terrace 1', capacity: 4 },
-            { restaurantId: restaurant.id, tableNumber: 6, tableName: 'Terrace 2', capacity: 6 },
-            { restaurantId: restaurant.id, tableNumber: 7, tableName: 'VIP', capacity: 8 },
-        ],
-    });
-
-    console.log(`✅ Tables: ${tables.count} created`);
-
-    // Create staff
-    await prisma.staff.deleteMany({ where: { restaurantId: restaurant.id } });
-
-    const waiterPin = await bcrypt.hash('1234', 10);
-    const kitchenPin = await bcrypt.hash('5678', 10);
-
-    await prisma.staff.createMany({
-        data: [
-            { restaurantId: restaurant.id, name: 'Ahmed', pin: waiterPin, role: 'WAITER' },
-            { restaurantId: restaurant.id, name: 'Fatima', pin: waiterPin, role: 'WAITER' },
-            { restaurantId: restaurant.id, name: 'Youssef', pin: kitchenPin, role: 'KITCHEN' },
-        ],
-    });
-
-    console.log(`✅ Staff: 3 created (Waiter PIN: 1234, Kitchen PIN: 5678)`);
-
-    // Create menu items
-    await prisma.menuItem.deleteMany({ where: { restaurantId: restaurant.id } });
-
-    const menuItems = await prisma.menuItem.createMany({
-        data: [
-            // Hot Drinks
-            {
-                restaurantId: restaurant.id,
-                name: 'Espresso',
-                nameFr: 'Expresso',
-                nameAr: 'إسبريسو',
-                description: 'Strong Italian coffee',
-                descriptionFr: 'Café italien fort',
-                descriptionAr: 'قهوة إيطالية قوية',
-                category: 'Hot Drinks',
-                categoryFr: 'Boissons Chaudes',
-                categoryAr: 'مشروبات ساخنة',
-                price: 15,
-                sortOrder: 1,
+        // Create demo tenant
+        const tenant = await prisma.tenant.upsert({
+            where: { slug: 'cafe-demo-dev' },
+            update: {},
+            create: {
+                slug: 'cafe-demo-dev',
+                businessName: 'Café Demo',
+                businessNameFr: 'Café Démo',
+                businessNameAr: 'مقهى ديمو',
+                city: 'Casablanca',
+                status: 'ACTIVE',
             },
-            {
-                restaurantId: restaurant.id,
-                name: 'Cappuccino',
-                nameFr: 'Cappuccino',
-                nameAr: 'كابتشينو',
-                description: 'Espresso with steamed milk foam',
-                descriptionFr: 'Expresso avec mousse de lait',
-                descriptionAr: 'إسبريسو مع رغوة الحليب',
-                category: 'Hot Drinks',
-                categoryFr: 'Boissons Chaudes',
-                categoryAr: 'مشروبات ساخنة',
-                price: 22,
-                sortOrder: 2,
-            },
-            {
-                restaurantId: restaurant.id,
-                name: 'Moroccan Mint Tea',
-                nameFr: 'Thé à la Menthe',
-                nameAr: 'أتاي بالنعناع',
-                description: 'Traditional green tea with fresh mint',
-                descriptionFr: 'Thé vert traditionnel à la menthe fraîche',
-                descriptionAr: 'شاي أخضر تقليدي بالنعناع الطازج',
-                category: 'Hot Drinks',
-                categoryFr: 'Boissons Chaudes',
-                categoryAr: 'مشروبات ساخنة',
-                price: 18,
-                sortOrder: 3,
-            },
-            {
-                restaurantId: restaurant.id,
-                name: 'Nous Nous',
-                nameFr: 'Nous Nous',
-                nameAr: 'نص نص',
-                description: 'Half coffee, half milk - Moroccan style',
-                descriptionFr: 'Moitié café, moitié lait - style marocain',
-                descriptionAr: 'نصف قهوة، نصف حليب - على الطريقة المغربية',
-                category: 'Hot Drinks',
-                categoryFr: 'Boissons Chaudes',
-                categoryAr: 'مشروبات ساخنة',
-                price: 14,
-                sortOrder: 4,
-            },
+        });
 
-            // Cold Drinks
-            {
-                restaurantId: restaurant.id,
-                name: 'Fresh Orange Juice',
-                nameFr: 'Jus d\'Orange Frais',
-                nameAr: 'عصير برتقال طازج',
-                category: 'Cold Drinks',
-                categoryFr: 'Boissons Froides',
-                categoryAr: 'مشروبات باردة',
-                price: 20,
-                sortOrder: 1,
-            },
-            {
-                restaurantId: restaurant.id,
-                name: 'Avocado Smoothie',
-                nameFr: 'Smoothie Avocat',
-                nameAr: 'سموذي الأفوكادو',
-                category: 'Cold Drinks',
-                categoryFr: 'Boissons Froides',
-                categoryAr: 'مشروبات باردة',
-                price: 30,
-                sortOrder: 2,
-            },
-            {
-                restaurantId: restaurant.id,
-                name: 'Iced Latte',
-                nameFr: 'Latte Glacé',
-                nameAr: 'لاتيه مثلج',
-                category: 'Cold Drinks',
-                categoryFr: 'Boissons Froides',
-                categoryAr: 'مشروبات باردة',
-                price: 25,
-                sortOrder: 3,
-            },
+        // Create subscription
+        const now = new Date();
+        const trialEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
 
-            // Pastries
-            {
-                restaurantId: restaurant.id,
-                name: 'Croissant',
-                nameFr: 'Croissant',
-                nameAr: 'كرواسون',
-                description: 'Buttery French pastry',
-                descriptionFr: 'Viennoiserie française au beurre',
-                descriptionAr: 'معجنات فرنسية بالزبدة',
-                category: 'Pastries',
-                categoryFr: 'Pâtisseries',
-                categoryAr: 'معجنات',
-                price: 12,
-                sortOrder: 1,
+        await prisma.subscription.upsert({
+            where: { tenantId: tenant.id },
+            update: {},
+            create: {
+                tenantId: tenant.id,
+                planId: starterPlan.id,
+                status: 'TRIAL',
+                currentPeriodStart: now,
+                currentPeriodEnd: trialEnd,
+                trialEndsAt: trialEnd,
             },
-            {
-                restaurantId: restaurant.id,
-                name: 'Pain au Chocolat',
-                nameFr: 'Pain au Chocolat',
-                nameAr: 'بان أو شوكولا',
-                category: 'Pastries',
-                categoryFr: 'Pâtisseries',
-                categoryAr: 'معجنات',
-                price: 15,
-                sortOrder: 2,
-            },
-            {
-                restaurantId: restaurant.id,
-                name: 'Msemen',
-                nameFr: 'Msemen',
-                nameAr: 'مسمن',
-                description: 'Traditional Moroccan flatbread',
-                descriptionFr: 'Pain plat marocain traditionnel',
-                descriptionAr: 'خبز مغربي تقليدي',
-                category: 'Pastries',
-                categoryFr: 'Pâtisseries',
-                categoryAr: 'معجنات',
-                price: 8,
-                sortOrder: 3,
-            },
-            {
-                restaurantId: restaurant.id,
-                name: 'Baghrir',
-                nameFr: 'Baghrir',
-                nameAr: 'بغرير',
-                description: 'Moroccan thousand-hole pancake',
-                descriptionFr: 'Crêpe marocaine aux mille trous',
-                descriptionAr: 'فطيرة مغربية بألف ثقب',
-                category: 'Pastries',
-                categoryFr: 'Pâtisseries',
-                categoryAr: 'معجنات',
-                price: 10,
-                sortOrder: 4,
-            },
+        });
 
-            // Breakfast
-            {
-                restaurantId: restaurant.id,
-                name: 'Moroccan Breakfast',
-                nameFr: 'Petit Déjeuner Marocain',
-                nameAr: 'فطور مغربي',
-                description: 'Msemen, eggs, honey, olive oil, mint tea',
-                descriptionFr: 'Msemen, œufs, miel, huile d\'olive, thé à la menthe',
-                descriptionAr: 'مسمن، بيض، عسل، زيت زيتون، أتاي',
-                category: 'Breakfast',
-                categoryFr: 'Petit Déjeuner',
-                categoryAr: 'فطور',
-                price: 45,
-                sortOrder: 1,
+        // Create owner
+        const owner = await prisma.user.upsert({
+            where: { email: 'owner@demo.cafe' },
+            update: {},
+            create: {
+                tenantId: tenant.id,
+                email: 'owner@demo.cafe',
+                passwordHash: demoOwnerPassword,
+                name: 'Demo Owner',
+                role: 'OWNER',
             },
-            {
-                restaurantId: restaurant.id,
-                name: 'Continental Breakfast',
-                nameFr: 'Petit Déjeuner Continental',
-                nameAr: 'فطور قاري',
-                description: 'Croissant, bread, butter, jam, coffee',
-                descriptionFr: 'Croissant, pain, beurre, confiture, café',
-                descriptionAr: 'كرواسون، خبز، زبدة، مربى، قهوة',
-                category: 'Breakfast',
-                categoryFr: 'Petit Déjeuner',
-                categoryAr: 'فطور',
-                price: 40,
-                sortOrder: 2,
-            },
+        });
 
-            // Snacks
-            {
-                restaurantId: restaurant.id,
-                name: 'Panini Chicken',
-                nameFr: 'Panini Poulet',
-                nameAr: 'بانيني دجاج',
-                category: 'Snacks',
-                categoryFr: 'Snacks',
-                categoryAr: 'وجبات خفيفة',
-                price: 35,
-                sortOrder: 1,
+        // Create default location
+        const location = await prisma.location.upsert({
+            where: { id: tenant.id }, // Will miss on first run, that's fine
+            update: {},
+            create: {
+                tenantId: tenant.id,
+                name: 'Café Demo - Downtown',
+                nameFr: 'Café Démo - Centre-ville',
+                address: '123 Bd Mohammed V, Casablanca',
             },
-            {
-                restaurantId: restaurant.id,
-                name: 'Mixed Salad',
-                nameFr: 'Salade Mixte',
-                nameAr: 'سلطة مشكلة',
-                category: 'Snacks',
-                categoryFr: 'Snacks',
-                categoryAr: 'وجبات خفيفة',
-                price: 28,
-                sortOrder: 2,
+        });
+
+        // Create staff
+        await prisma.user.upsert({
+            where: { email: 'waiter@demo.cafe' },
+            update: {},
+            create: {
+                tenantId: tenant.id,
+                email: 'waiter@demo.cafe',
+                passwordHash: demoOwnerPassword,
+                name: 'Ahmed (Waiter)',
+                role: 'WAITER',
+                pin: demoStaffPin,
             },
-        ],
-    });
+        });
 
-    console.log(`✅ Menu Items: ${menuItems.count} created`);
+        await prisma.user.upsert({
+            where: { email: 'kitchen@demo.cafe' },
+            update: {},
+            create: {
+                tenantId: tenant.id,
+                email: 'kitchen@demo.cafe',
+                passwordHash: demoOwnerPassword,
+                name: 'Fatima (Kitchen)',
+                role: 'KITCHEN',
+                pin: demoStaffPin,
+            },
+        });
 
-    console.log('\n🎉 Database seeded successfully!');
-    console.log('\n📋 Demo Credentials:');
-    console.log('   Admin: admin@cafedemo.ma / admin123');
-    console.log('   Waiter PIN: 1234');
-    console.log('   Kitchen PIN: 5678');
+        // Create tables
+        for (let i = 1; i <= 6; i++) {
+            await prisma.table.upsert({
+                where: {
+                    locationId_tableNumber: { locationId: location.id, tableNumber: i },
+                },
+                update: {},
+                create: {
+                    locationId: location.id,
+                    tableNumber: i,
+                    tableName: `Table ${i}`,
+                    capacity: i <= 4 ? 4 : 6,
+                },
+            });
+        }
+
+        // Create menu items
+        const menuItems = [
+            { name: 'Espresso', nameFr: 'Espresso', nameAr: 'إسبريسو', category: 'Coffee', categoryFr: 'Café', categoryAr: 'قهوة', price: 15, sortOrder: 1 },
+            { name: 'Latte', nameFr: 'Latte', nameAr: 'لاتيه', category: 'Coffee', categoryFr: 'Café', categoryAr: 'قهوة', price: 25, sortOrder: 2 },
+            { name: 'Cappuccino', nameFr: 'Cappuccino', nameAr: 'كابوتشينو', category: 'Coffee', categoryFr: 'Café', categoryAr: 'قهوة', price: 25, sortOrder: 3 },
+            { name: 'Mint Tea', nameFr: 'Thé à la menthe', nameAr: 'أتاي', category: 'Tea', categoryFr: 'Thé', categoryAr: 'شاي', price: 12, sortOrder: 1 },
+            { name: 'Croissant', nameFr: 'Croissant', nameAr: 'كرواسان', category: 'Pastries', categoryFr: 'Pâtisseries', categoryAr: 'حلويات', price: 18, sortOrder: 1 },
+            { name: 'Pain au Chocolat', nameFr: 'Pain au Chocolat', nameAr: 'بان أو شوكولا', category: 'Pastries', categoryFr: 'Pâtisseries', categoryAr: 'حلويات', price: 20, sortOrder: 2 },
+        ];
+
+        for (const item of menuItems) {
+            const existing = await prisma.menuItem.findFirst({
+                where: { locationId: location.id, name: item.name },
+            });
+
+            if (!existing) {
+                await prisma.menuItem.create({
+                    data: { locationId: location.id, ...item },
+                });
+            }
+        }
+
+        console.log(`  ✅ Demo tenant: ${tenant.businessName} (${tenant.slug})`);
+        console.log(`     Owner: owner@demo.cafe / demo12345`);
+        console.log(`     Staff PIN: 1234`);
+    }
+
+    console.log('\n🌱 Seeding complete!');
 }
 
 main()
-    .catch((e) => {
+    .catch(e => {
         console.error('Seed error:', e);
         process.exit(1);
     })

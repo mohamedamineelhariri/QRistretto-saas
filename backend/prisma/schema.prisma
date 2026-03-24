@@ -1,5 +1,6 @@
-// Prisma Schema for QR Cafe Ordering System
-// Security: Prisma ORM prevents SQL injection by design
+// QRistretto SaaS Multi-Tenant Schema
+// Production-grade schema with full tenant isolation,
+// subscription management, RBAC, and WhatsApp engine support.
 
 generator client {
   provider = "prisma-client-js"
@@ -11,85 +12,212 @@ datasource db {
 }
 
 // ============================================
-// RESTAURANT
+// TENANT (Top-level business entity)
 // ============================================
-model Restaurant {
-  id            String   @id @default(uuid())
-  name          String   // English name
-  nameFr        String?  // French name
-  nameAr        String?  // Arabic name
-  adminEmail    String   @unique
-  adminPassword String   // Hashed with bcrypt
-  isActive      Boolean  @default(true)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+model Tenant {
+  id             String       @id @default(uuid())
+  slug           String       @unique // URL-safe: "cafe-atlas-casa"
+  businessName   String
+  businessNameFr String?
+  businessNameAr String?
+  logoUrl        String?
+  phoneNumber    String?
+  address        String?
+  city           String?
+  country        String       @default("MA")
+  settings       Json         @default("{}")
+  status         TenantStatus @default(PENDING_APPROVAL)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
 
   // Relations
-  tables       Table[]
-  menuItems    MenuItem[]
-  orders       Order[]
-  wifiNetworks WifiNetwork[]
-  staff        Staff[]
+  users             User[]
+  locations         Location[]
+  subscription      Subscription?
+  whatsappSessions  WhatsAppSession[]
 
-  @@map("restaurants")
+  @@map("tenants")
+}
+
+enum TenantStatus {
+  PENDING_APPROVAL
+  ACTIVE
+  SUSPENDED
+  CHURNED
 }
 
 // ============================================
-// WIFI NETWORK (Multi-network support)
+// PLAN (Subscription tiers)
+// ============================================
+model Plan {
+  id              String   @id @default(uuid())
+  name            String   @unique // "STARTER", "PRO", "ENTERPRISE"
+  displayName     String
+  displayNameFr   String?
+  displayNameAr   String?
+  priceMAD        Int      // Monthly in centimes: 14900, 39900, 89900
+  maxOrdersPerDay Int?     // null = unlimited
+  maxStaff        Int?     // null = unlimited
+  maxLocations    Int      @default(1)
+  features        Json     // ["whatsapp_bot", "inventory_alerts", "pdf_reports"]
+  isActive        Boolean  @default(true)
+  sortOrder       Int      @default(0)
+  createdAt       DateTime @default(now())
+
+  subscriptions Subscription[]
+
+  @@map("plans")
+}
+
+// ============================================
+// SUBSCRIPTION
+// ============================================
+model Subscription {
+  id                 String             @id @default(uuid())
+  tenantId           String             @unique
+  planId             String
+  status             SubscriptionStatus @default(TRIAL)
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  trialEndsAt        DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  plan   Plan   @relation(fields: [planId], references: [id])
+
+  @@map("subscriptions")
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+  CANCELLED
+}
+
+// ============================================
+// USER (Unified auth model — replaces Restaurant.adminEmail)
+// ============================================
+model User {
+  id           String    @id @default(uuid())
+  tenantId     String
+  email        String    @unique
+  passwordHash String
+  name         String
+  role         UserRole  @default(STAFF)
+  pin          String?   // Quick staff login (hashed), 4-6 digits
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  tenant      Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  permissions UserPermission[]
+  orders      Order[]          // Waiter assignment
+
+  @@index([tenantId])
+  @@map("users")
+}
+
+enum UserRole {
+  OWNER    // Full access + billing
+  MANAGER  // Location management
+  WAITER   // Order handling
+  KITCHEN  // Kitchen dashboard
+  STAFF    // Generic / read-only
+}
+
+model UserPermission {
+  id         String @id @default(uuid())
+  userId     String
+  permission String // e.g. "menu:write", "orders:read", "inventory:manage"
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, permission])
+  @@map("user_permissions")
+}
+
+// ============================================
+// SUPER ADMIN (Platform-level, outside tenant hierarchy)
+// ============================================
+model SuperAdmin {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  totpSecret   String?  // TOTP MFA secret
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("super_admins")
+}
+
+// ============================================
+// LOCATION (Physical restaurant site — replaces Restaurant)
+// ============================================
+model Location {
+  id           String   @id @default(uuid())
+  tenantId     String
+  name         String   // "Casa Downtown", "Marrakech Branch"
+  nameFr       String?
+  nameAr       String?
+  address      String?
+  phoneNumber  String?
+  isActive     Boolean  @default(true)
+  settings     Json     @default("{}") // Location-specific overrides
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant         Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tables         Table[]
+  menuItems      MenuItem[]
+  orders         Order[]
+  wifiNetworks   WifiNetwork[]
+  inventoryItems InventoryItem[]
+  bundles        Bundle[]
+
+  @@index([tenantId])
+  @@map("locations")
+}
+
+// ============================================
+// WIFI NETWORK (Multi-network per location)
 // ============================================
 model WifiNetwork {
-  id           String  @id @default(uuid())
-  restaurantId String
-  networkName  String  // e.g., "Cafe_5G", "Cafe_2.4G"
-  ipRange      String  // CIDR notation: "192.168.1.0/24"
-  networkType  String  @default("main") // "5G", "2.4G", "guest"
-  isActive     Boolean @default(true)
+  id          String  @id @default(uuid())
+  locationId  String
+  networkName String  // "Cafe_5G", "Cafe_2.4G"
+  ipRange     String  // CIDR: "192.168.1.0/24"
+  networkType String  @default("main") // "5G", "2.4G", "guest"
+  isActive    Boolean @default(true)
 
-  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
 
   @@map("wifi_networks")
-}
-
-// ============================================
-// STAFF (Waiters, Kitchen staff)
-// ============================================
-model Staff {
-  id           String    @id @default(uuid())
-  restaurantId String
-  name         String
-  pin          String    // 4-6 digit PIN, hashed
-  role         StaffRole @default(WAITER)
-  isActive     Boolean   @default(true)
-  createdAt    DateTime  @default(now())
-
-  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
-
-  @@map("staff")
-}
-
-enum StaffRole {
-  WAITER
-  KITCHEN
-  MANAGER
 }
 
 // ============================================
 // TABLE
 // ============================================
 model Table {
-  id           String   @id @default(uuid())
-  restaurantId String
-  tableNumber  Int
-  tableName    String?  // Optional: "Terrace 1", "VIP"
-  capacity     Int      @default(4)
-  isActive     Boolean  @default(true)
-  createdAt    DateTime @default(now())
+  id          String   @id @default(uuid())
+  locationId  String
+  tableNumber Int
+  tableName   String?  // "Terrace 1", "VIP"
+  capacity    Int      @default(4)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
 
-  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
-  qrTokens   QRToken[]
-  orders     Order[]
+  location Location  @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  qrTokens QRToken[]
+  orders   Order[]
 
-  @@unique([restaurantId, tableNumber])
+  @@unique([locationId, tableNumber])
   @@map("tables")
 }
 
@@ -99,7 +227,7 @@ model Table {
 model QRToken {
   id        String   @id @default(uuid())
   tableId   String
-  token     String   @unique // Random secure token
+  token     String   @unique
   expiresAt DateTime
   createdAt DateTime @default(now())
 
@@ -115,35 +243,39 @@ model QRToken {
 // ============================================
 model MenuItem {
   id           String  @id @default(uuid())
-  restaurantId String
-  
+  locationId   String
+
   // Trilingual names
   name         String  // English
-  nameFr       String? // French
-  nameAr       String? // Arabic
-  
+  nameFr       String?
+  nameAr       String?
+
   // Trilingual descriptions
   description   String?
   descriptionFr String?
   descriptionAr String?
-  
+
   // Trilingual categories
   category     String  // English
-  categoryFr   String? // French
-  categoryAr   String? // Arabic
-  
-  price        Decimal  @db.Decimal(10, 2)
-  imageUrl     String?
-  available    Boolean  @default(true)
-  sortOrder    Int      @default(0)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  categoryFr   String?
+  categoryAr   String?
 
-  restaurant Restaurant  @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
-  orderItems OrderItem[]
+  price           Decimal  @db.Decimal(10, 2)
+  imageUrl        String?
+  available       Boolean  @default(true)
+  sortOrder       Int      @default(0)
+  prepTimeMinutes Int?
+  calories        Int?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
-  @@index([restaurantId, category])
-  @@index([restaurantId, available])
+  location    Location    @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  orderItems  OrderItem[]
+  recipeItems RecipeItem[]
+  bundleItems BundleItem[]
+
+  @@index([locationId, category])
+  @@index([locationId, available])
   @@map("menu_items")
 }
 
@@ -151,32 +283,41 @@ model MenuItem {
 // ORDER
 // ============================================
 model Order {
-  id           String      @id @default(uuid())
-  restaurantId String
-  tableId      String
-  orderNumber  Int         // Daily incrementing number
-  status       OrderStatus @default(PENDING)
-  totalAmount  Decimal     @db.Decimal(10, 2)
-  notes        String?     // Customer notes
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
+  id          String      @id @default(uuid())
+  locationId  String
+  tableId     String
+  orderNumber Int         // Daily incrementing number
+  status      OrderStatus @default(PENDING)
+  totalAmount Decimal     @db.Decimal(10, 2)
+  notes       String?
+  source      OrderSource @default(QR_MENU) // How the order was placed
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
 
-  restaurant Restaurant  @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
-  table      Table       @relation(fields: [tableId], references: [id])
-  items      OrderItem[]
+  location Location    @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  table    Table       @relation(fields: [tableId], references: [id])
+  items    OrderItem[]
+  waiterId String?
+  waiter   User?       @relation(fields: [waiterId], references: [id])
 
-  @@index([restaurantId, status])
-  @@index([restaurantId, createdAt])
+  @@index([locationId, status])
+  @@index([locationId, createdAt])
   @@map("orders")
 }
 
 enum OrderStatus {
-  PENDING    // Customer submitted, waiting for waiter
+  PENDING    // Customer submitted
   ACCEPTED   // Waiter accepted
-  PREPARING  // Kitchen is preparing
-  READY      // Ready for pickup/delivery
+  PREPARING  // Kitchen preparing
+  READY      // Ready for delivery
   DELIVERED  // Delivered to table
-  CANCELLED  // Order cancelled
+  CANCELLED  // Cancelled
+}
+
+enum OrderSource {
+  QR_MENU    // Traditional QR scan
+  WHATSAPP   // WhatsApp bot order
+  STAFF      // Staff-created order
 }
 
 // ============================================
@@ -187,11 +328,146 @@ model OrderItem {
   orderId    String
   menuItemId String
   quantity   Int     @default(1)
-  unitPrice  Decimal @db.Decimal(10, 2) // Price at time of order
-  notes      String? // Item-specific notes
+  unitPrice  Decimal @db.Decimal(10, 2)
+  notes      String?
 
   order    Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
   menuItem MenuItem @relation(fields: [menuItemId], references: [id])
 
   @@map("order_items")
+}
+
+// ============================================
+// INVENTORY ITEM
+// ============================================
+model InventoryItem {
+  id           String   @id @default(uuid())
+  locationId   String
+  name         String
+  nameFr       String?
+  nameAr       String?
+  unit         String   // "kg", "liters", "pieces"
+  currentStock Decimal  @db.Decimal(10, 3)
+  minStock     Decimal  @db.Decimal(10, 3)
+  costPerUnit  Decimal  @db.Decimal(10, 2)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  location    Location     @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  recipeItems RecipeItem[]
+
+  @@index([locationId])
+  @@map("inventory_items")
+}
+
+// ============================================
+// RECIPE ITEM (MenuItem → Ingredients Mapping)
+// ============================================
+model RecipeItem {
+  id              String  @id @default(uuid())
+  menuItemId      String
+  inventoryItemId String
+  quantity        Decimal @db.Decimal(10, 3)
+
+  menuItem      MenuItem      @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  inventoryItem InventoryItem @relation(fields: [inventoryItemId], references: [id])
+
+  @@unique([menuItemId, inventoryItemId])
+  @@map("recipe_items")
+}
+
+// ============================================
+// BUNDLE (Combo Meals)
+// ============================================
+model Bundle {
+  id            String   @id @default(uuid())
+  locationId    String
+  name          String
+  nameFr        String?
+  nameAr        String?
+  description   String?
+  descriptionFr String?
+  descriptionAr String?
+  price         Decimal  @db.Decimal(10, 2)
+  imageUrl      String?
+  available     Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  location Location     @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  items    BundleItem[]
+
+  @@index([locationId])
+  @@map("bundles")
+}
+
+model BundleItem {
+  id         String @id @default(uuid())
+  bundleId   String
+  menuItemId String
+  quantity   Int    @default(1)
+
+  bundle   Bundle   @relation(fields: [bundleId], references: [id], onDelete: Cascade)
+  menuItem MenuItem @relation(fields: [menuItemId], references: [id])
+
+  @@unique([bundleId, menuItemId])
+  @@map("bundle_items")
+}
+
+// ============================================
+// WHATSAPP SESSION (Per-tenant session management)
+// ============================================
+model WhatsAppSession {
+  id          String   @id @default(uuid())
+  tenantId    String
+  phoneNumber String
+  authState   Json     // Serialized Baileys auth credentials
+  isActive    Boolean  @default(true)
+  lastUsedAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, phoneNumber])
+  @@map("whatsapp_sessions")
+}
+
+// ============================================
+// TRUST & FRAUD ENGINE
+// ============================================
+model PhoneReputation {
+  id                String   @id @default(uuid())
+  phoneNumber       String   @unique // E.164: "+212600000000"
+  globalScore       Int      @default(0)
+  totalOrders       Int      @default(0)
+  successfulOrders  Int      @default(0)
+  flaggedCount      Int      @default(0)
+  isVerified        Boolean  @default(false) // "Verified Buyer" badge
+  isGloballyBlocked Boolean  @default(false)
+  blockedReason     String?
+  blockedAt         DateTime?
+  firstSeenAt       DateTime @default(now())
+  lastSeenAt        DateTime @default(now())
+  metadata          Json     @default("{}") // Account age heuristics
+
+  flags PhoneFlag[]
+
+  @@map("phone_reputations")
+}
+
+model PhoneFlag {
+  id              String   @id @default(uuid())
+  phoneNumber     String
+  tenantId        String
+  flaggedByUserId String
+  reason          String   // "fake_order", "abusive", "no_show"
+  orderId         String?
+  createdAt       DateTime @default(now())
+
+  phone PhoneReputation @relation(fields: [phoneNumber], references: [phoneNumber])
+
+  @@index([phoneNumber])
+  @@index([tenantId])
+  @@map("phone_flags")
 }
