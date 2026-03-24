@@ -16,7 +16,7 @@ class ApiClient {
         this.token = token;
     }
 
-    private async request<T>(
+    async request<T>(
         endpoint: string,
         options: RequestInit = {}
     ): Promise<ApiResponse<T>> {
@@ -39,7 +39,10 @@ class ApiClient {
             const data = await response.json();
 
             if (!response.ok) {
-                throw new Error(data.message || 'Request failed');
+                const error = new Error(data.message || 'Request failed') as any;
+                error.status = response.status;
+                error.data = data;
+                throw error;
             }
 
             return data;
@@ -55,18 +58,38 @@ class ApiClient {
             tableId: string;
             tableNumber: number;
             tableName: string | null;
-            restaurantId: string;
-            restaurant: {
+            locationId: string;
+            location: {
                 id: string;
                 name: string;
                 nameFr: string | null;
                 nameAr: string | null;
             };
+            tenant: {
+                id: string;
+                slug: string;
+                businessName: string;
+                businessNameFr: string | null;
+                businessNameAr: string | null;
+            }
         }>(`/qr/validate/${token}`);
     }
 
+    // Tenant Resolution
+    async resolveSlug(slug: string) {
+        return this.request<{
+            tenantId: string;
+            slug: string;
+            businessName: string;
+            businessNameFr: string | null;
+            businessNameAr: string | null;
+            locationId: string;
+            locationName: string;
+        }>(`/tenant/resolve/${slug}`);
+    }
+
     // Menu
-    async getMenu(restaurantId: string, locale: string = 'en') {
+    async getMenu(locationId: string, locale: string = 'en') {
         return this.request<{
             categories: Array<{
                 category: string;
@@ -86,7 +109,7 @@ class ApiClient {
                 }>;
             }>;
             locale: string;
-        }>(`/menu/${restaurantId}?locale=${locale}`);
+        }>(`/menu/${locationId}?locale=${locale}`);
     }
 
     // Orders
@@ -111,21 +134,40 @@ class ApiClient {
 
     // Staff - Active orders
     async getActiveOrders() {
-        return this.request<{ orders: unknown[] }>('/orders/active/list');
+        return this.request<{ orders: any[] }>('/orders/active/list');
     }
 
     async updateOrderStatus(orderId: string, status: string) {
-        return this.request<{ order: unknown }>(`/orders/${orderId}/status`, {
+        return this.request<{ order: any }>(`/orders/${orderId}/status`, {
             method: 'PATCH',
             body: JSON.stringify({ status }),
         });
     }
 
-    // Auth
+    // Auth & Signup
+    async getPublicPlans() {
+        return this.request<{ plans: any[] }>('/signup/plans');
+    }
+
+    async signup(data: { businessName: string; ownerName: string; email: string; password: string; planName: string }) {
+        return this.request<{ 
+            token: string;
+            tenant: { slug: string; id: string; businessName: string };
+            user: { id: string; name: string; email: string; role: string };
+            locationId: string;
+        }>('/signup', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        });
+    }
+
+
     async login(email: string, password: string) {
         const response = await this.request<{
             token: string;
-            restaurant: { id: string; name: string; email: string };
+            user: { id: string; name: string; email: string; role: string; tenantId: string; permissions: string[] };
+            tenant: { id: string; businessName: string; slug: string; status: string };
+            location: { id: string; name: string };
         }>('/auth/login', {
             method: 'POST',
             body: JSON.stringify({ email, password }),
@@ -134,6 +176,14 @@ class ApiClient {
         if (response.success && response.data?.token) {
             this.setToken(response.data.token);
             localStorage.setItem('admin_token', response.data.token);
+            // Save admin_info for access to ID and active locationId
+            localStorage.setItem('admin_info', JSON.stringify({
+                id: response.data.user.id,
+                name: response.data.user.name,
+                role: response.data.user.role,
+                tenantId: response.data.tenant.id,
+                locationId: response.data.location?.id,
+            }));
         }
 
         return response;
@@ -142,18 +192,32 @@ class ApiClient {
     async logout() {
         this.setToken(null);
         localStorage.removeItem('admin_token');
+        localStorage.removeItem('staff_token');
+        localStorage.removeItem('admin_info');
         return this.request('/auth/logout', { method: 'POST' });
     }
 
-    async staffLogin(staffId: string, pin: string) {
-        return this.request<{
+    async staffLogin(staffId: string, pin: string, locationId: string) {
+        const response = await this.request<{
             token: string;
-            staff: { id: string; name: string; role: string };
-            restaurant: { id: string; name: string };
+            user: { id: string; name: string; role: string; tenantId: string };
+            tenant: { id: string; businessName: string; status: string };
+            location: { id: string; name: string };
         }>('/auth/staff-login', {
             method: 'POST',
-            body: JSON.stringify({ staffId, pin }),
+            body: JSON.stringify({ userId: staffId, pin, locationId }),
         });
+
+        if (response.success && response.data?.token) {
+            this.setToken(response.data.token);
+            localStorage.setItem('staff_token', response.data.token);
+            localStorage.setItem('staff_info', JSON.stringify({
+                ...response.data.user,
+                locationId: response.data.location.id
+            }));
+        }
+
+        return response;
     }
 
     // Admin - Dashboard
@@ -169,25 +233,25 @@ class ApiClient {
 
     // Admin - Menu CRUD
     async getAllMenuItems() {
-        return this.request<{ items: unknown[] }>('/menu/admin/all');
+        return this.request<{ items: any[] }>('/menu/admin/all');
     }
 
-    async createMenuItem(data: unknown) {
-        return this.request<{ item: unknown }>('/menu', {
+    async createMenuItem(data: any) {
+        return this.request<{ item: any }>('/menu', {
             method: 'POST',
             body: JSON.stringify(data),
         });
     }
 
-    async updateMenuItem(itemId: string, data: unknown) {
-        return this.request<{ item: unknown }>(`/menu/${itemId}`, {
+    async updateMenuItem(itemId: string, data: any) {
+        return this.request<{ item: any }>(`/menu/${itemId}`, {
             method: 'PUT',
             body: JSON.stringify(data),
         });
     }
 
     async toggleMenuItem(itemId: string) {
-        return this.request<{ item: unknown }>(`/menu/${itemId}/toggle`, {
+        return this.request<{ item: any }>(`/menu/${itemId}/toggle`, {
             method: 'PATCH',
         });
     }
@@ -196,9 +260,72 @@ class ApiClient {
         return this.request(`/menu/${itemId}`, { method: 'DELETE' });
     }
 
+    // Admin - Inventory
+    async getInventory() {
+        return this.request<{ items: any[] }>('/admin/inventory');
+    }
+
+    async getLowStock() {
+        return this.request<{ items: any[] }>('/admin/inventory/low-stock');
+    }
+
+    async createInventoryItem(data: any) {
+        return this.request<{ item: any }>('/admin/inventory', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        });
+    }
+
+    async updateInventoryItem(itemId: string, data: any) {
+        return this.request<{ item: any }>(`/admin/inventory/${itemId}`, {
+            method: 'PUT',
+            body: JSON.stringify(data),
+        });
+    }
+
+    async addStock(itemId: string, quantity: number) {
+        return this.request<{ item: any }>(`/admin/inventory/${itemId}/add-stock`, {
+            method: 'PATCH',
+            body: JSON.stringify({ quantity }),
+        });
+    }
+
+    async deleteInventoryItem(itemId: string) {
+        return this.request(`/admin/inventory/${itemId}`, { method: 'DELETE' });
+    }
+
+    // Admin - Bundles
+    async getBundles() {
+        return this.request<{ bundles: any[] }>('/admin/bundles');
+    }
+
+    async createBundle(data: any) {
+        return this.request<{ bundle: any }>('/admin/bundles', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        });
+    }
+
+    async updateBundle(bundleId: string, data: any) {
+        return this.request<{ bundle: any }>(`/admin/bundles/${bundleId}`, {
+            method: 'PUT',
+            body: JSON.stringify(data),
+        });
+    }
+
+    async deleteBundle(bundleId: string) {
+        return this.request(`/admin/bundles/${bundleId}`, { method: 'DELETE' });
+    }
+
+    async toggleBundle(bundleId: string) {
+        return this.request<{ bundle: any }>(`/admin/bundles/${bundleId}/toggle`, {
+            method: 'PATCH',
+        });
+    }
+
     // Admin - Tables
     async getTables() {
-        return this.request<{ tables: unknown[] }>('/tables');
+        return this.request<{ tables: any[] }>('/tables');
     }
 
     async createTable(data: { tableNumber: number; tableName?: string; capacity?: number }) {
@@ -206,6 +333,17 @@ class ApiClient {
             method: 'POST',
             body: JSON.stringify(data),
         });
+    }
+
+    async updateTable(tableId: string, data: { tableName?: string; capacity?: number; isActive?: boolean }) {
+        return this.request<{ table: unknown }>(`/tables/${tableId}`, {
+            method: 'PUT',
+            body: JSON.stringify(data),
+        });
+    }
+
+    async deleteTable(tableId: string) {
+        return this.request(`/tables/${tableId}`, { method: 'DELETE' });
     }
 
     async generateQR(tableId: string) {
@@ -227,6 +365,10 @@ class ApiClient {
         return this.request<{ staff: unknown[] }>('/admin/staff');
     }
 
+    async getPublicStaffList(locationId: string) {
+        return this.request<{ staff: any[] }>(`/auth/staff?locationId=${locationId}`);
+    }
+
     async createStaff(data: { name: string; pin: string; role: string }) {
         return this.request<{ staff: unknown }>('/admin/staff', {
             method: 'POST',
@@ -234,9 +376,15 @@ class ApiClient {
         });
     }
 
+    async getOrderHistory(limit = 50, offset = 0, staffId?: string) {
+        let url = `/orders/history/list?limit=${limit}&offset=${offset}`;
+        if (staffId) url += `&staffId=${staffId}`;
+        return this.request<{ orders: any[]; pagination: { limit: number; offset: number } }>(url);
+    }
+
     // Admin - WiFi Networks
-    async getRestaurant() {
-        return this.request<{ restaurant: unknown }>('/admin/restaurant');
+    async getLocationSettings() {
+        return this.request<{ location: unknown }>('/admin/location');
     }
 
     async addWifiNetwork(data: { networkName: string; ipRange: string; networkType?: string }) {
@@ -246,10 +394,67 @@ class ApiClient {
         });
     }
 
+    async updateLocationSettings(data: any) {
+        return this.request<{ location: any }>('/admin/location', {
+            method: 'PUT',
+            body: JSON.stringify(data),
+        });
+    }
+
+    async deleteWifiNetwork(networkId: string) {
+        return this.request(`/admin/wifi-networks/${networkId}`, { method: 'DELETE' });
+    }
+
+    // Super Admin
+    async superAdminLogin(email: string, password: string) {
+        const response = await this.request<{
+            token: string;
+            user: { id: string; email: string; role: string };
+        }>('/super-admin/login', {
+            method: 'POST',
+            body: JSON.stringify({ email, password }),
+        });
+
+        if (response.success && response.data?.token) {
+            this.setToken(response.data.token);
+            localStorage.setItem('super_admin_token', response.data.token);
+        }
+
+        return response;
+    }
+
+    async getTenants() {
+        return this.request<{ tenants: any[] }>('/super-admin/tenants');
+    }
+
+    async updateTenantStatus(tenantId: string, status: string) {
+        return this.request<{ tenant: any }>(`/super-admin/tenants/${tenantId}/status`, {
+            method: 'PATCH',
+            body: JSON.stringify({ status }),
+        });
+    }
+
+    async getPlans() {
+        return this.request<{ plans: any[] }>('/super-admin/plans');
+    }
+
+    async getPlatformAnalytics() {
+        return this.request<{
+            totalTenants: number;
+            activeTenants: number;
+            totalMRR: number;
+            dailyOrders: number;
+        }>('/super-admin/analytics');
+    }
+
     // Initialize from localStorage
     init() {
         if (typeof window !== 'undefined') {
-            const token = localStorage.getItem('admin_token');
+            const adminToken = localStorage.getItem('admin_token');
+            const staffToken = localStorage.getItem('staff_token');
+            const superToken = localStorage.getItem('super_admin_token');
+            const token = superToken || adminToken || staffToken;
+
             if (token) {
                 this.setToken(token);
             }

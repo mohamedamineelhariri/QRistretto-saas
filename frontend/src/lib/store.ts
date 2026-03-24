@@ -15,14 +15,14 @@ interface CartItem {
 interface CartState {
     items: CartItem[];
     tableId: string | null;
-    restaurantId: string | null;
+    locationId: string | null;
     token: string | null;
     addItem: (item: Omit<CartItem, 'quantity'>) => void;
     removeItem: (menuItemId: string) => void;
     updateQuantity: (menuItemId: string, quantity: number) => void;
     updateNotes: (menuItemId: string, notes: string) => void;
     clearCart: () => void;
-    setTableInfo: (tableId: string, restaurantId: string, token: string) => void;
+    setTableInfo: (tableId: string, locationId: string, token: string) => void;
     getTotal: () => number;
     getItemCount: () => number;
 }
@@ -32,7 +32,7 @@ export const useCartStore = create<CartState>()(
         (set, get) => ({
             items: [],
             tableId: null,
-            restaurantId: null,
+            locationId: null,
             token: null,
 
             addItem: (item) => {
@@ -90,8 +90,8 @@ export const useCartStore = create<CartState>()(
                 set({ items: [] });
             },
 
-            setTableInfo: (tableId, restaurantId, token) => {
-                set({ tableId, restaurantId, token });
+            setTableInfo: (tableId, locationId, token) => {
+                set({ tableId, locationId, token });
             },
 
             getTotal: () => {
@@ -107,7 +107,7 @@ export const useCartStore = create<CartState>()(
             partialize: (state) => ({
                 items: state.items,
                 tableId: state.tableId,
-                restaurantId: state.restaurantId,
+                locationId: state.locationId,
                 token: state.token,
             }),
         }
